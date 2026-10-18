@@ -3,3 +3,4 @@ ptx/
 *.ncu-rep
 *.nsys-rep
 .direnv
+dist/

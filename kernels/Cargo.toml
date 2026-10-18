@@ -1,0 +1,18 @@
+[package]
+name = "kernels"
+version = "0.1.0"
+edition = "2024"
+
+# this crate has to be in its own workspace since it is compiled by cargo-oxide.
+[workspace]
+
+[features]
+sm_80  = [] # cp.async, m16n8k16 mma, bf16
+sm_89  = [] # fp8 mma
+sm_120 = [] # cp.async.bulk + mbarrier
+
+[dependencies]
+# Keep this and the flake's cuda-oxide input in sync
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "6d47ae49cb256a07948fb499c20c3eb9b2a96268" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "6d47ae49cb256a07948fb499c20c3eb9b2a96268" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "6d47ae49cb256a07948fb499c20c3eb9b2a96268" }

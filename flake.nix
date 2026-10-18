@@ -19,11 +19,15 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        rustChannel = (builtins.fromTOML (builtins.readFile "${cuda-oxide}/rust-toolchain.toml")).toolchain.channel;
       in
       {
         devShells.default = pkgs.mkShell {
           # CUDA, Rust, LLVM, cargo-oxide and the shellHook that finds the host driver.
           inputsFrom = [ cuda-oxide.devShells.${system}.default ];
+          # The shell's rustc is the nix one, but cargo-oxide checks the toolchain with
+          # `rustup show active-toolchain` when rustup is installed; tell rustup the same nightly.
+          RUSTUP_TOOLCHAIN = rustChannel;
         };
       }
     );

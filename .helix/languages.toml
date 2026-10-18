@@ -1,0 +1,3 @@
+# kernels/ is its own cargo workspace; load it alongside the host crate.
+[language-server.rust-analyzer.config]
+linkedProjects = ["Cargo.toml", "kernels/Cargo.toml"]
