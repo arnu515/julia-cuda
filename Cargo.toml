@@ -1,0 +1,10 @@
+[package]
+name = "julia-cuda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+julia-rs = { git = "https://github.com/arnu515/julia-rs" }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "f16"] }
+half = "2"
+color-eyre = "0.6.5"

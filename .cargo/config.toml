@@ -1,0 +1,3 @@
+# needed for julia-rs
+[build]
+rustflags = ["-C", "target-feature=+avx2,+fma,+f16c,+bmi2"]

@@ -1,0 +1,5 @@
+target/
+ptx/
+*.ncu-rep
+*.nsys-rep
+.direnv
