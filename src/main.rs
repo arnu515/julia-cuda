@@ -7,6 +7,10 @@ use cudarc::{
 };
 use julia_rs::{ModelPaths, load_model, matmul::Precision};
 
+// Used by the weight upload (next); until then only by its tests.
+#[allow(dead_code)]
+mod prep;
+
 const USAGE: &str = "usage: julia-cuda [checkpoint dir]
   Without a checkpoint, only checks that the kernels load and run on GPU 0.";
 

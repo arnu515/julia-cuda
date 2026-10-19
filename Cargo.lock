@@ -214,9 +214,9 @@ dependencies = [
 [[package]]
 name = "julia-rs"
 version = "0.1.0"
-source = "git+https://github.com/arnu515/julia-rs#6ef2d31e7ec40400e2d4869d136401d63120ed84"
+source = "git+https://github.com/arnu515/julia-rs#6006d2bcdb3533840c530aee99cd8cb9b6aab6a9"
 dependencies = [
- "color-eyre",
+ "eyre",
  "memmap2",
  "rayon",
  "serde",
