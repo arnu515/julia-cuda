@@ -2,7 +2,9 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use color_eyre::eyre::{Context, bail, ensure};
 use cudarc::{
-    driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg},
+    driver::{
+        CudaContext, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+    },
     nvrtc::Ptx,
 };
 
@@ -157,6 +159,65 @@ pub fn embed(
     Ok(x)
 }
 
+/// Threads per block for `gemm`: 16 × 16, each computing 4 × 4 outputs of a 64 × 64 tile.
+const GEMM_BLOCK: u32 = 256;
+/// The tile `gemm` computes per block, and its K step: n has to be a multiple of `GEMM_TILE`
+/// and k of `GEMM_BK` (rows of `a` past m are handled).
+const GEMM_TILE: usize = 64;
+const GEMM_BK: usize = 32;
+
+/// Runs the tiled GEMM: `c = a · wᵀ`, with `a` `[m, k]`, `w` `[n, k]` and `c` `[m, n]`, all f16.
+pub fn gemm(
+    stream: &Arc<CudaStream>,
+    kernels: &Arc<CudaModule>,
+    a: &CudaSlice<half::f16>,
+    w: &CudaView<half::f16>,
+    k: usize,
+) -> color_eyre::Result<CudaSlice<half::f16>> {
+    ensure!(
+        k > 0 && k.is_multiple_of(GEMM_BK),
+        "gemm: k = {k} is not a multiple of {GEMM_BK}"
+    );
+    ensure!(
+        a.len().is_multiple_of(k) && w.len().is_multiple_of(k),
+        "gemm: a ({}) or w ({}) is not a whole number of rows of {k}",
+        a.len(),
+        w.len()
+    );
+    let (m, n) = (a.len() / k, w.len() / k);
+    ensure!(m > 0, "gemm: no rows");
+    ensure!(
+        n.is_multiple_of(GEMM_TILE),
+        "gemm: n = {n} is not a multiple of {GEMM_TILE}"
+    );
+    let mut c = stream.alloc_zeros(m * n)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: ((n / GEMM_TILE) as u32, m.div_ceil(GEMM_TILE) as u32, 1),
+        block_dim: (GEMM_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // The kernel's k is a u32: `arg` copies as many bytes as the Rust type has, so a usize would
+    // shift every parameter after it.
+    let (a_len, w_len, k) = (a.len() as u64, w.len() as u64, k as u32);
+
+    let gemm_kernel = kernels.load_function("gemm")?;
+    let mut launch = stream.launch_builder(&gemm_kernel);
+    // gemm(a: &[f16], w: &[f16], k: u32, c: *mut f16)
+    launch
+        .arg(a)
+        .arg(&a_len)
+        .arg(w)
+        .arg(&w_len)
+        .arg(&k)
+        .arg(&mut c);
+    // SAFETY: the arguments match that signature, with the checks above: k is a multiple of 32,
+    //   n of 64, and c has m·n elements. a is a cudarc allocation and w a weight span, so both
+    //   are 16-byte aligned. The block is 256 threads, as the kernel's indexing assumes.
+    unsafe { launch.launch(cfg) }?;
+    Ok(c)
+}
+
 /// The request the kernels run on until requests come from stdin.
 fn sample_request() -> Request<'static> {
     Request {
@@ -234,9 +295,23 @@ fn main() -> color_eyre::Result<()> {
     stream.synchronize()?;
     eprintln!("embed: {} tokens in {:.3} ms", seq.ids.len(), ms(t));
 
+    // Layer 0 has no attention LayerNorm, so its qkv GEMM runs on x as is.
+    let wqkv = gpu.f16.slice(gpu.layout.layers[0].wqkv.range());
+    let t = Instant::now();
+    let qkv = gemm(&stream, &kernels, &x, &wqkv, D)?;
+    stream.synchronize()?;
+    eprintln!(
+        "qkv (layer 0): {} × {} in {:.3} ms",
+        seq.ids.len(),
+        qkv.len() / seq.ids.len(),
+        ms(t)
+    );
+
     if check {
         let model = check::reference_model(&dir)?;
-        check::embed(&model, &host, &seq.ids, c.norm_eps, &stream.clone_dtoh(&x)?)?;
+        let x = stream.clone_dtoh(&x)?;
+        check::embed(&model, &host, &seq.ids, c.norm_eps, &x)?;
+        check::qkv0(&model, &host, &seq.ids, &x, &stream.clone_dtoh(&qkv)?)?;
     }
     Ok(())
 }

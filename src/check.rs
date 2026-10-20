@@ -9,7 +9,10 @@ use std::path::Path;
 
 use color_eyre::eyre::ensure;
 use half::f16;
-use julia_rs::{Model, ModelPaths, load_model, matmul::Precision};
+use julia_rs::{
+    Model, ModelPaths, load_model,
+    matmul::{Precision, linear},
+};
 
 use crate::{D, weights::HostWeights};
 
@@ -101,6 +104,55 @@ pub fn embed(
     Ok(())
 }
 
+/// What `gemm` computes, on the host: `x · wᵀ` from the same f16 inputs, summed in f64 and rounded
+/// to f16. `x` is `[m, k]`, `w` `[n, k]`.
+fn emulate_gemm(x: &[f16], w: &[f16], k: usize) -> Vec<f16> {
+    let w: Vec<f64> = w.iter().map(|&v| f64::from(v)).collect();
+    (x.chunks_exact(k))
+        .flat_map(|row| {
+            let row: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            w.chunks_exact(k)
+                .map(move |wr| f16::from_f64(row.iter().zip(wr).map(|(a, b)| a * b).sum()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Layer 0's qkv GEMM output `qkv` (from `embed`'s output `x`) against julia-rs (its f32 embedding
+/// times its f32 Wqkv) and against the emulation on the same f16 `x`. The kernel sums 384 terms in
+/// f32, the emulation in f64, so values near zero can be a few ulps apart; the relative error is
+/// what passes or fails.
+pub fn qkv0(
+    model: &Model,
+    host: &HostWeights,
+    ids: &[u32],
+    x: &[f16],
+    qkv: &[f16],
+) -> color_eyre::Result<()> {
+    let got: Vec<f32> = qkv.iter().map(|v| v.to_f32()).collect();
+    let mut want = vec![0.0; ids.len() * 3 * D];
+    linear(
+        &model.embed(ids),
+        &model.packed.encoder[0].wqkv,
+        None,
+        &mut want,
+    );
+    let rel = rel_err(&got, &want);
+
+    let emu = emulate_gemm(x, &host.f16[host.layout.layers[0].wqkv.range()], D);
+    let emu_f32: Vec<f32> = emu.iter().map(|v| v.to_f32()).collect();
+    let rel_emu = rel_err(&got, &emu_f32);
+    let worst = emu.iter().zip(qkv).map(|(&a, &b)| ulps(a, b)).max();
+    eprintln!(
+        "qkv (layer 0): vs julia-rs {rel:.2e} relative; vs emulation {rel_emu:.2e} relative, \
+         worst {} ulp",
+        worst.unwrap_or(0)
+    );
+    ensure!(rel < 2e-3, "qkv is {rel:.2e} off julia-rs");
+    ensure!(rel_emu < 1e-3, "qkv is {rel_emu:.2e} off the emulation");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -144,5 +196,36 @@ mod tests {
         let mut bad = x.clone();
         bad[100] = f16::from_bits(bad[100].to_bits() + 2);
         assert!(embed(&model, &host, &seq.ids, c.norm_eps, &bad).is_err());
+
+        // The qkv check, the same way: the emulation passes, and so do plain f32 sums in k order,
+        // which round like the kernel's f32 accumulators...
+        let wqkv = &host.f16[host.layout.layers[0].wqkv.range()];
+        let qkv = emulate_gemm(&x, wqkv, D);
+        qkv0(&model, &host, &seq.ids, &x, &qkv).unwrap();
+        let f32_sums: Vec<f16> = (x.as_chunks::<D>().0.iter())
+            .flat_map(|row| {
+                wqkv.as_chunks::<D>().0.iter().map(move |wr| {
+                    let s: f32 = row
+                        .iter()
+                        .zip(wr)
+                        .map(|(a, b)| a.to_f32() * b.to_f32())
+                        .sum();
+                    f16::from_f32(s)
+                })
+            })
+            .collect();
+        qkv0(&model, &host, &seq.ids, &x, &f32_sums).unwrap();
+        // ...and the bugs a tiling mistake makes fail: a 64-row block of a tile left at zero, and
+        // two columns swapped.
+        let mut zeroed = qkv.clone();
+        for r in 0..seq.ids.len() {
+            zeroed[r * 3 * D + 64..][..64].fill(f16::ZERO);
+        }
+        assert!(qkv0(&model, &host, &seq.ids, &x, &zeroed).is_err());
+        let mut swapped = qkv.clone();
+        for r in 0..seq.ids.len() {
+            swapped.swap(r * 3 * D + 3, r * 3 * D + 19);
+        }
+        assert!(qkv0(&model, &host, &seq.ids, &x, &swapped).is_err());
     }
 }
