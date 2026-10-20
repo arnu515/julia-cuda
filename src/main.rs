@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use color_eyre::eyre::{Context, bail, ensure};
 use cudarc::{
     driver::{
-        CudaContext, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+        CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
+        sys::CUdevice_attribute,
     },
     nvrtc::Ptx,
 };
@@ -11,6 +12,7 @@ use cudarc::{
 mod check;
 mod checkpoint;
 mod prep;
+mod timing;
 // The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
 #[allow(dead_code)]
 mod weights;
@@ -22,10 +24,11 @@ use julia_rs::{
 };
 use weights::{GpuWeights, HostWeights};
 
-const USAGE: &str = "usage: julia-cuda [checkpoint dir [--check]]
+const USAGE: &str = "usage: julia-cuda [checkpoint dir [--check] [--time]]
   Without a checkpoint, only checks that the kernels load on GPU 0. With one, runs the kernels on
   a sample request.
-  --check also verifies the weight upload and compares each kernel's output with julia-rs.";
+  --check also verifies the weight upload and compares each kernel's output with julia-rs.
+  --time  also measures each kernel's GPU time (CUDA events, after warm-up).";
 
 /// Generated with `embed_ptx!`.
 struct EmbeddedPtx {
@@ -81,9 +84,16 @@ macro_rules! embed_ptx {
 
 embed_ptx!("sm_120", "sm_89", "sm_80", "sm_75");
 
+/// The kernels, looked up once (`load_function` is a lookup in the module: not something to
+/// repeat per launch).
+pub struct Kernels {
+    embed: CudaFunction,
+    gemm: CudaFunction,
+}
+
 /// Loads the embedded PTX, after checking that this GPU can run its tier. The driver
 /// JIT-compiles PTX forward (sm_80 PTX runs on sm_89) but never backward.
-fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Arc<CudaModule>> {
+fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
     let (major, minor) = ctx.compute_capability()?;
     let (name, sm) = (ctx.name()?, (major * 10 + minor) as u32);
     // The newest tier this GPU can run, i.e. what the binary should have been built with.
@@ -108,7 +118,10 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Arc<CudaModule>> {
             rebuild(t)
         );
     }
-    Ok(module)
+    Ok(Kernels {
+        embed: module.load_function("embed")?,
+        gemm: module.load_function("gemm")?,
+    })
 }
 
 /// Hidden size of the model.
@@ -121,18 +134,36 @@ const EMBED_BLOCK: u32 = 128;
 /// Runs the embedding kernel: the residual stream `x` (`[tokens.len(), D]`, f16) for `tokens`.
 pub fn embed(
     stream: &Arc<CudaStream>,
-    kernels: &Arc<CudaModule>,
+    kernels: &Kernels,
     w: &GpuWeights,
     tokens: &CudaSlice<u32>,
     eps: f32,
 ) -> color_eyre::Result<CudaSlice<half::f16>> {
+    let mut x = stream.alloc_zeros(tokens.len() * D)?;
+    embed_into(stream, kernels, w, tokens, eps, &mut x)?;
+    Ok(x)
+}
+
+/// `embed` into an existing `x`.
+pub fn embed_into(
+    stream: &Arc<CudaStream>,
+    kernels: &Kernels,
+    w: &GpuWeights,
+    tokens: &CudaSlice<u32>,
+    eps: f32,
+    x: &mut CudaSlice<half::f16>,
+) -> color_eyre::Result<()> {
     let table = w.f16.slice(w.layout.tok_embeddings.range());
     let table_len = table.len() as u64;
     let gamma = w.f32.slice(w.layout.emb_norm.range());
     let gamma_len = gamma.len() as u64;
     let n = tokens.len();
     ensure!(n > 0, "embed: no tokens");
-    let mut x = stream.alloc_zeros(n * D)?;
+    ensure!(
+        x.len() == n * D,
+        "embed: x has {} elements, not {n} × {D}",
+        x.len()
+    );
     let n = n as u64;
 
     let cfg = LaunchConfig {
@@ -141,8 +172,7 @@ pub fn embed(
         shared_mem_bytes: 0,
     };
 
-    let embed_kernel = kernels.load_function("embed")?;
-    let mut launch = stream.launch_builder(&embed_kernel);
+    let mut launch = stream.launch_builder(&kernels.embed);
     // embed(tokens: &[u32], table: &[f16], gamma: &[f32], eps: f32, x: *mut f16)
     launch
         .arg(tokens)
@@ -152,11 +182,11 @@ pub fn embed(
         .arg(&gamma)
         .arg(&gamma_len)
         .arg(&eps)
-        .arg(&mut x);
+        .arg(x);
     // SAFETY: the arguments match that signature, block size is a multiple of 32,
     //   and x's dimensions match properly.
     unsafe { launch.launch(cfg) }?;
-    Ok(x)
+    Ok(())
 }
 
 /// Threads per block for `gemm`: 16 × 16, each computing 4 × 4 outputs of a 64 × 64 tile.
@@ -169,11 +199,26 @@ const GEMM_BK: usize = 32;
 /// Runs the tiled GEMM: `c = a · wᵀ`, with `a` `[m, k]`, `w` `[n, k]` and `c` `[m, n]`, all f16.
 pub fn gemm(
     stream: &Arc<CudaStream>,
-    kernels: &Arc<CudaModule>,
+    kernels: &Kernels,
     a: &CudaSlice<half::f16>,
     w: &CudaView<half::f16>,
     k: usize,
 ) -> color_eyre::Result<CudaSlice<half::f16>> {
+    ensure!(k > 0, "gemm: k = 0");
+    let mut c = stream.alloc_zeros(a.len() / k * (w.len() / k))?;
+    gemm_into(stream, kernels, a, w, k, &mut c)?;
+    Ok(c)
+}
+
+/// `gemm` into an existing `c`.
+pub fn gemm_into(
+    stream: &Arc<CudaStream>,
+    kernels: &Kernels,
+    a: &CudaSlice<half::f16>,
+    w: &CudaView<half::f16>,
+    k: usize,
+    c: &mut CudaSlice<half::f16>,
+) -> color_eyre::Result<()> {
     ensure!(
         k > 0 && k.is_multiple_of(GEMM_BK),
         "gemm: k = {k} is not a multiple of {GEMM_BK}"
@@ -190,7 +235,11 @@ pub fn gemm(
         n.is_multiple_of(GEMM_TILE),
         "gemm: n = {n} is not a multiple of {GEMM_TILE}"
     );
-    let mut c = stream.alloc_zeros(m * n)?;
+    ensure!(
+        c.len() == m * n,
+        "gemm: c has {} elements, not {m} × {n}",
+        c.len()
+    );
 
     let cfg = LaunchConfig {
         grid_dim: ((n / GEMM_TILE) as u32, m.div_ceil(GEMM_TILE) as u32, 1),
@@ -201,21 +250,14 @@ pub fn gemm(
     // shift every parameter after it.
     let (a_len, w_len, k) = (a.len() as u64, w.len() as u64, k as u32);
 
-    let gemm_kernel = kernels.load_function("gemm")?;
-    let mut launch = stream.launch_builder(&gemm_kernel);
+    let mut launch = stream.launch_builder(&kernels.gemm);
     // gemm(a: &[f16], w: &[f16], k: u32, c: *mut f16)
-    launch
-        .arg(a)
-        .arg(&a_len)
-        .arg(w)
-        .arg(&w_len)
-        .arg(&k)
-        .arg(&mut c);
+    launch.arg(a).arg(&a_len).arg(w).arg(&w_len).arg(&k).arg(c);
     // SAFETY: the arguments match that signature, with the checks above: k is a multiple of 32,
     //   n of 64, and c has m·n elements. a is a cudarc allocation and w a weight span, so both
     //   are 16-byte aligned. The block is 256 threads, as the kernel's indexing assumes.
     unsafe { launch.launch(cfg) }?;
-    Ok(c)
+    Ok(())
 }
 
 /// The request the kernels run on until requests come from stdin.
@@ -236,14 +278,19 @@ fn sample_request() -> Request<'static> {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (dir, check) = match args.as_slice() {
-        [] => (None, false),
-        [dir] if !dir.starts_with('-') => (Some(PathBuf::from(dir)), false),
-        [dir, flag] if !dir.starts_with('-') && flag == "--check" => {
-            (Some(PathBuf::from(dir)), true)
-        }
-        _ => bail!(USAGE),
+    let (dir, flags) = match args.split_first() {
+        None => (None, &[][..]),
+        Some((dir, flags)) if !dir.starts_with('-') => (Some(PathBuf::from(dir)), flags),
+        Some(_) => bail!(USAGE),
     };
+    let (mut check, mut time) = (false, false);
+    for flag in flags {
+        match flag.as_str() {
+            "--check" => check = true,
+            "--time" => time = true,
+            _ => bail!(USAGE),
+        }
+    }
 
     let ctx = CudaContext::new(0)?;
     let kernels = load_kernels(&ctx)?;
@@ -290,20 +337,17 @@ fn main() -> color_eyre::Result<()> {
         DEFAULT_HEAD_LENGTH,
     )?;
     let ids = stream.clone_htod(&seq.ids)?;
+    // Wall clock around the first calls: this includes allocating the outputs and loading each
+    // kernel onto the GPU (CUDA does that on the first launch). --time measures the kernels.
     let t = Instant::now();
-    let x = embed(&stream, &kernels, &gpu, &ids, c.norm_eps)?;
-    stream.synchronize()?;
-    eprintln!("embed: {} tokens in {:.3} ms", seq.ids.len(), ms(t));
-
+    let mut x = embed(&stream, &kernels, &gpu, &ids, c.norm_eps)?;
     // Layer 0 has no attention LayerNorm, so its qkv GEMM runs on x as is.
     let wqkv = gpu.f16.slice(gpu.layout.layers[0].wqkv.range());
-    let t = Instant::now();
-    let qkv = gemm(&stream, &kernels, &x, &wqkv, D)?;
+    let mut qkv = gemm(&stream, &kernels, &x, &wqkv, D)?;
     stream.synchronize()?;
     eprintln!(
-        "qkv (layer 0): {} × {} in {:.3} ms",
+        "embed + qkv (layer 0) for {} tokens: {:.3} ms, first call (wall clock)",
         seq.ids.len(),
-        qkv.len() / seq.ids.len(),
         ms(t)
     );
 
@@ -312,6 +356,64 @@ fn main() -> color_eyre::Result<()> {
         let x = stream.clone_dtoh(&x)?;
         check::embed(&model, &host, &seq.ids, c.norm_eps, &x)?;
         check::qkv0(&model, &host, &seq.ids, &x, &stream.clone_dtoh(&qkv)?)?;
+    }
+
+    if time {
+        let n = seq.ids.len();
+        let l2 = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)? as f64 / 1e6;
+        let (warmup, batches, per_batch) = (20, 20, 100);
+        let run = |launch: &mut dyn FnMut() -> color_eyre::Result<()>| {
+            timing::time(&stream, warmup, batches, per_batch, launch)
+        };
+        eprintln!(
+            "timing: GPU time per call, fastest / median of {batches} batches of {per_batch} \
+             calls (after {warmup}); {l2:.1} MB L2"
+        );
+
+        let t = run(&mut || embed_into(&stream, &kernels, &gpu, &ids, c.norm_eps, &mut x))?;
+        eprintln!(
+            "  embed                    {n} tokens            {:>7.2} / {:>7.2} µs",
+            t.min_us, t.median_us
+        );
+
+        let flop = 2.0 * (n * 3 * D * D) as f64;
+        let wqkv_mb = (wqkv.len() * 2) as f64 / 1e6;
+        let t = run(&mut || gemm_into(&stream, &kernels, &x, &wqkv, D, &mut qkv))?;
+        eprintln!(
+            "  qkv, layer 0's weights   {n} × {} × {D}    {:>7.2} / {:>7.2} µs   {:.2} TFLOP/s   \
+             ({wqkv_mb:.2} MB of weights, stays in L2)",
+            3 * D,
+            t.min_us,
+            t.median_us,
+            flop / t.median_us / 1e6
+        );
+
+        // Every layer's Wqkv in turn: the same shape, but together more than fits in L2 (on
+        // GPUs with less L2 than this), so the weights come from DRAM as in a forward pass.
+        // Layers 1..21 hold the folded weights; the values don't matter for timing.
+        let all: Vec<_> = (gpu.layout.layers.iter())
+            .map(|l| gpu.f16.slice(l.wqkv.range()))
+            .collect();
+        let mut i = 0;
+        let t = run(&mut || {
+            i = (i + 1) % all.len();
+            gemm_into(&stream, &kernels, &x, &all[i], D, &mut qkv)
+        })?;
+        eprintln!(
+            "  qkv, {} layers' in turn  {n} × {} × {D}    {:>7.2} / {:>7.2} µs   {:.2} TFLOP/s   \
+             ({:.1} MB of weights{})",
+            all.len(),
+            3 * D,
+            t.min_us,
+            t.median_us,
+            flop / t.median_us / 1e6,
+            wqkv_mb * all.len() as f64,
+            if wqkv_mb * all.len() as f64 > l2 {
+                ", more than L2"
+            } else {
+                ", fits in L2: still warm"
+            }
+        );
     }
     Ok(())
 }
