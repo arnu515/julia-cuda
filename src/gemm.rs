@@ -110,7 +110,7 @@ pub fn configs() -> impl Iterator<Item = Config> {
 /// The configuration for an m × n × k GEMM on a GPU with `sms` SMs. A rough rule from
 /// GEMM microbenchmark sweeps (2080 Ti and 4070, m = 160–2048) and `--time` at m = 72: the smallest
 /// tiles until there are enough rows to fill the GPU with bigger ones; no split-K while there
-/// are at least half as many tiles as SMs (qkv and wi at m = 72: splitting only adds the
+/// are more than half as many tiles as SMs (qkv and wi at m = 72: splitting only adds the
 /// reduction), else 4 splits (wo and wo_mlp at m = 72: within 3% of the best on the 2080 Ti,
 /// the best on the 4070), keeping each split ≥ 3 K steps. `--time` sweeps every configuration
 /// for the request at hand.
@@ -121,7 +121,8 @@ pub fn choose(m: usize, n: usize, k: usize, sms: usize) -> Config {
         _ => Shape::S128w8,
     };
     let tiles = (n / 64) * m.div_ceil(shape.bm());
-    let splits = if 2 * tiles >= sms { 1 } else { 4 };
+    // Strictly more: at 2·tiles == sms (wo and wo_mlp on the 4070's 36 SMs) splitting wins.
+    let splits = if 2 * tiles > sms { 1 } else { 4 };
     Config {
         shape,
         splits: splits.min((k / 32 / 3).max(1) as u32),

@@ -6,7 +6,10 @@
 //! calls faster than the GPU runs them. For a kernel shorter than a launch (a few µs), it can't,
 //! and the batch average is the launch rate instead.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use cudarc::driver::{CudaStream, sys::CUevent_flags};
 
@@ -15,6 +18,24 @@ pub struct Timing {
     pub min_us: f64,
     /// The median batch's average, µs per call.
     pub median_us: f64,
+}
+
+/// Keeps the GPU busy with `launch` for at least `at_least`. GPUs (laptop ones especially) leave
+/// their power-saving clocks only under sustained load, over hundreds of milliseconds: a 4070
+/// Laptop measured at 1500 MHz in P3 after a few ms of warm-up, against ~1.9 GHz under load.
+pub fn warm_up(
+    stream: &Arc<CudaStream>,
+    at_least: Duration,
+    mut launch: impl FnMut() -> color_eyre::Result<()>,
+) -> color_eyre::Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < at_least {
+        for _ in 0..100 {
+            launch()?;
+        }
+        stream.synchronize()?;
+    }
+    Ok(())
 }
 
 /// Times `launch`, which queues one call: `warmup` calls first (the first launch loads the kernel,

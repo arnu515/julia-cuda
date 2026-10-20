@@ -411,6 +411,10 @@ fn main() -> color_eyre::Result<()> {
              calls (after {warmup}); {l2:.1} MB L2"
         );
 
+        // Half a second of GEMMs first, so the clocks are up before anything is measured.
+        timing::warm_up(&stream, std::time::Duration::from_millis(500), || {
+            gemm_tiled_into(&stream, &kernels, &x, &wqkv, D, &mut qkv)
+        })?;
         let t = run(&mut || embed_into(&stream, &kernels, &gpu, &ids, c.norm_eps, &mut x))?;
         eprintln!(
             "  embed                    {n} tokens            {:>7.2} / {:>7.2} µs",
