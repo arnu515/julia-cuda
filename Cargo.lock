@@ -210,6 +210,7 @@ dependencies = [
  "half",
  "julia-rs",
  "memmap2",
+ "serde_json",
 ]
 
 [[package]]

@@ -7,3 +7,5 @@ dist/
 # From building the kernels directly (cargo oxide build in kernels/) rather than with make.
 kernels/*.ptx
 kernels/*.ll
+# The 2000 typed-decisions requests, labels and julia-rs f32 output (README: Run).
+data/

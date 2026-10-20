@@ -15,6 +15,7 @@ mod checkpoint;
 mod forward;
 mod gemm;
 mod prep;
+mod serve;
 mod timing;
 // The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
 #[allow(dead_code)]
@@ -27,11 +28,15 @@ use julia_rs::{
 };
 use weights::{GpuWeights, HostWeights};
 
-const USAGE: &str = "usage: julia-cuda [checkpoint dir [--check] [--time]]
-  Without a checkpoint, only checks that the kernels load on GPU 0. With one, runs the kernels on
-  a sample request.
-  --check also verifies the weight upload and compares each kernel's output with julia-rs.
-  --time  also measures each kernel's GPU time (CUDA events, after warm-up).";
+const USAGE: &str =
+    "usage: julia-cuda [checkpoint dir [--max-length N] [--head-length N]] < requests.jsonl
+       julia-cuda checkpoint dir [--check] [--time]
+  Without a checkpoint, only checks that the kernels load on GPU 0. With one, answers the requests
+  on stdin, one JSON object per line, as julia-rs does (same fields, same order), and reports the
+  latency on stderr. --max-length and --head-length are julia-rs's (default 8192 and 512).
+  --check runs the kernels on two sample requests instead, and compares every step with julia-rs
+  (the weight upload, each kernel, each layer, the head, the whole forward pass).
+  --time  measures each kernel's GPU time on them (CUDA events, after warm-up).";
 
 /// Generated with `embed_ptx!`.
 struct EmbeddedPtx {
@@ -316,10 +321,18 @@ fn main() -> color_eyre::Result<()> {
         Some(_) => bail!(USAGE),
     };
     let (mut check, mut time) = (false, false);
-    for flag in flags {
+    let (mut max_length, mut head_length) = (None, DEFAULT_HEAD_LENGTH);
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let mut number = || -> color_eyre::Result<usize> {
+            let v = flags.next().ok_or_else(|| color_eyre::eyre::eyre!(USAGE))?;
+            v.parse().wrap_err_with(|| format!("{flag} {v}"))
+        };
         match flag.as_str() {
             "--check" => check = true,
             "--time" => time = true,
+            "--max-length" => max_length = Some(number()?),
+            "--head-length" => head_length = number()?,
             _ => bail!(USAGE),
         }
     }
@@ -361,6 +374,11 @@ fn main() -> color_eyre::Result<()> {
         gpu.verify(&stream, &host)?;
         eprintln!("upload verified: both buffers bit-exact");
     }
+    let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+    if !check && !time {
+        let max_length = max_length.unwrap_or(c.max_positions);
+        return serve::serve(&stream, &kernels, &gpu, &ck, sms, max_length, head_length);
+    }
 
     let seq = sequence(
         &ck.tokenizer,
@@ -384,7 +402,6 @@ fn main() -> color_eyre::Result<()> {
     );
 
     let n = seq.ids.len();
-    let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
     // The long request's (for checking the attention window, and timing at 363 tokens).
     let long = sequence(
         &ck.tokenizer,

@@ -18,3 +18,4 @@ cudarc = { version = "0.19", default-features = false, features = ["std", "drive
 half = "2"
 memmap2 = "0.9.11"
 color-eyre = "0.6.5"
+serde_json = "1.0.154"
