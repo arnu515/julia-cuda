@@ -11,6 +11,7 @@ use cudarc::{
 
 mod check;
 mod checkpoint;
+mod gemm;
 mod prep;
 mod timing;
 // The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
@@ -88,7 +89,10 @@ embed_ptx!("sm_120", "sm_89", "sm_80", "sm_75");
 /// repeat per launch).
 pub struct Kernels {
     embed: CudaFunction,
-    gemm: CudaFunction,
+    /// The shared-memory tiled GEMM on CUDA cores (`gemm_tiled`), kept as a baseline.
+    gemm_tiled: CudaFunction,
+    /// The tensor-core GEMMs.
+    gemm: gemm::GemmKernels,
 }
 
 /// Loads the embedded PTX, after checking that this GPU can run its tier. The driver
@@ -120,7 +124,8 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
     }
     Ok(Kernels {
         embed: module.load_function("embed")?,
-        gemm: module.load_function("gemm")?,
+        gemm_tiled: module.load_function("gemm_tiled")?,
+        gemm: gemm::GemmKernels::load(&module)?,
     })
 }
 
@@ -189,15 +194,16 @@ pub fn embed_into(
     Ok(())
 }
 
-/// Threads per block for `gemm`: 16 × 16, each computing 4 × 4 outputs of a 64 × 64 tile.
+/// Threads per block for `gemm_tiled`: 16 × 16, each computing 4 × 4 outputs of a 64 × 64 tile.
 const GEMM_BLOCK: u32 = 256;
-/// The tile `gemm` computes per block, and its K step: n has to be a multiple of `GEMM_TILE`
+/// The tile `gemm_tiled` computes per block, and its K step: n has to be a multiple of `GEMM_TILE`
 /// and k of `GEMM_BK` (rows of `a` past m are handled).
 const GEMM_TILE: usize = 64;
 const GEMM_BK: usize = 32;
 
-/// Runs the tiled GEMM: `c = a · wᵀ`, with `a` `[m, k]`, `w` `[n, k]` and `c` `[m, n]`, all f16.
-pub fn gemm(
+/// Runs the CUDA-core tiled GEMM: `c = a · wᵀ`, with `a` `[m, k]`, `w` `[n, k]` and `c`
+/// `[m, n]`, all f16. The baseline for the tensor-core GEMMs (`gemm::launch`).
+pub fn gemm_tiled(
     stream: &Arc<CudaStream>,
     kernels: &Kernels,
     a: &CudaSlice<half::f16>,
@@ -206,12 +212,12 @@ pub fn gemm(
 ) -> color_eyre::Result<CudaSlice<half::f16>> {
     ensure!(k > 0, "gemm: k = 0");
     let mut c = stream.alloc_zeros(a.len() / k * (w.len() / k))?;
-    gemm_into(stream, kernels, a, w, k, &mut c)?;
+    gemm_tiled_into(stream, kernels, a, w, k, &mut c)?;
     Ok(c)
 }
 
-/// `gemm` into an existing `c`.
-pub fn gemm_into(
+/// `gemm_tiled` into an existing `c`.
+pub fn gemm_tiled_into(
     stream: &Arc<CudaStream>,
     kernels: &Kernels,
     a: &CudaSlice<half::f16>,
@@ -250,8 +256,8 @@ pub fn gemm_into(
     // shift every parameter after it.
     let (a_len, w_len, k) = (a.len() as u64, w.len() as u64, k as u32);
 
-    let mut launch = stream.launch_builder(&kernels.gemm);
-    // gemm(a: &[f16], w: &[f16], k: u32, c: *mut f16)
+    let mut launch = stream.launch_builder(&kernels.gemm_tiled);
+    // gemm_tiled(a: &[f16], w: &[f16], k: u32, c: *mut f16)
     launch.arg(a).arg(&a_len).arg(w).arg(&w_len).arg(&k).arg(c);
     // SAFETY: the arguments match that signature, with the checks above: k is a multiple of 32,
     //   n of 64, and c has m·n elements. a is a cudarc allocation and w a weight span, so both
@@ -343,7 +349,7 @@ fn main() -> color_eyre::Result<()> {
     let mut x = embed(&stream, &kernels, &gpu, &ids, c.norm_eps)?;
     // Layer 0 has no attention LayerNorm, so its qkv GEMM runs on x as is.
     let wqkv = gpu.f16.slice(gpu.layout.layers[0].wqkv.range());
-    let mut qkv = gemm(&stream, &kernels, &x, &wqkv, D)?;
+    let mut qkv = gemm_tiled(&stream, &kernels, &x, &wqkv, D)?;
     stream.synchronize()?;
     eprintln!(
         "embed + qkv (layer 0) for {} tokens: {:.3} ms, first call (wall clock)",
@@ -351,11 +357,46 @@ fn main() -> color_eyre::Result<()> {
         ms(t)
     );
 
+    let n = seq.ids.len();
+    let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+    let scratch = gemm::Scratch::new(&stream, n)?;
+    let mut layers = check::GpuGemms::new(
+        &stream,
+        &kernels.gemm,
+        &scratch,
+        &gpu,
+        c.norm_eps,
+        sms,
+        stream.clone_dtod(&x)?,
+        c.intermediate,
+    )?;
+    let inter = c.intermediate;
+    let shapes = [
+        ("qkv", 3 * D, D),
+        ("wo", D, D),
+        ("wi", 2 * inter, D),
+        ("wo_mlp", D, inter),
+    ];
+    eprintln!(
+        "gemm configurations for {n} tokens on {sms} SMs: {}",
+        (shapes.iter())
+            .map(|&(name, nn, k)| format!("{name} {}", layers.config_for(nn, k)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     if check {
         let model = check::reference_model(&dir)?;
         let x = stream.clone_dtoh(&x)?;
         check::embed(&model, &host, &seq.ids, c.norm_eps, &x)?;
         check::qkv0(&model, &host, &seq.ids, &x, &stream.clone_dtoh(&qkv)?)?;
+        let traces = check::trace(&model, &seq.ids);
+        // Each layer from julia-rs's stream, then from embed's output through all 22 (with
+        // julia-rs's attention outputs both times).
+        check::layers(&mut layers, &traces, false)?;
+        stream.memcpy_htod(&x, &mut layers.x)?;
+        check::layers(&mut layers, &traces, true)?;
+        check::sweep(&mut layers, 1, &traces[1])?;
     }
 
     if time {
@@ -378,41 +419,70 @@ fn main() -> color_eyre::Result<()> {
 
         let flop = 2.0 * (n * 3 * D * D) as f64;
         let wqkv_mb = (wqkv.len() * 2) as f64 / 1e6;
-        let t = run(&mut || gemm_into(&stream, &kernels, &x, &wqkv, D, &mut qkv))?;
+        let t = run(&mut || gemm_tiled_into(&stream, &kernels, &x, &wqkv, D, &mut qkv))?;
         eprintln!(
-            "  qkv, layer 0's weights   {n} × {} × {D}    {:>7.2} / {:>7.2} µs   {:.2} TFLOP/s   \
-             ({wqkv_mb:.2} MB of weights, stays in L2)",
-            3 * D,
+            "  qkv (layer 0), CUDA-core tiled GEMM: {:.2} / {:.2} µs, {:.2} TFLOP/s \
+             ({wqkv_mb:.2} MB of weights, in L2)",
             t.min_us,
             t.median_us,
             flop / t.median_us / 1e6
         );
 
-        // Every layer's Wqkv in turn: the same shape, but together more than fits in L2 (on
-        // GPUs with less L2 than this), so the weights come from DRAM as in a forward pass.
-        // Layers 1..21 hold the folded weights; the values don't matter for timing.
-        let all: Vec<_> = (gpu.layout.layers.iter())
-            .map(|l| gpu.f16.slice(l.wqkv.range()))
-            .collect();
-        let mut i = 0;
-        let t = run(&mut || {
-            i = (i + 1) % all.len();
-            gemm_into(&stream, &kernels, &x, &all[i], D, &mut qkv)
-        })?;
-        eprintln!(
-            "  qkv, {} layers' in turn  {n} × {} × {D}    {:>7.2} / {:>7.2} µs   {:.2} TFLOP/s   \
-             ({:.1} MB of weights{})",
-            all.len(),
-            3 * D,
-            t.min_us,
-            t.median_us,
-            flop / t.median_us / 1e6,
-            wqkv_mb * all.len() as f64,
-            if wqkv_mb * all.len() as f64 > l2 {
-                ", more than L2"
-            } else {
-                ", fits in L2: still warm"
+        // The tensor-core GEMMs, as one layer runs them. The in-place residual GEMMs keep
+        // adding to the stream, so its values are meaningless from here on: timing comes last.
+        // Each configuration with layer 1's weights (in L2), then the chosen one rotating
+        // through every layer's weights (from DRAM when they don't fit in L2).
+        let quick = |launch: &mut dyn FnMut() -> color_eyre::Result<()>| {
+            timing::time(&stream, 5, 7, 30, launch)
+        };
+        let mut layer_total = 0.0;
+        for (gi, &(name, nn, k)) in shapes.iter().enumerate() {
+            let flop = 2.0 * (n * nn * k) as f64;
+            let launch = |g: &mut check::GpuGemms, l: usize| match gi {
+                0 => g.launch_qkv(l),
+                1 => g.launch_wo(l),
+                2 => g.launch_wi(l),
+                _ => g.launch_wo_mlp(l),
+            };
+            eprintln!("  {name} ({n} × {nn} × {k}), µs per call (median), by tile and split-K:");
+            let mut best: Option<(f64, gemm::Config)> = None;
+            for shape in gemm::SHAPES {
+                let mut row = format!("    {:>5}x64", shape.name());
+                for splits in 1..=4u32 {
+                    let cfg = gemm::Config { shape, splits };
+                    if splits as usize > k / 32 {
+                        continue;
+                    }
+                    layers.config = Some(cfg);
+                    let t = quick(&mut || launch(&mut layers, 1))?;
+                    row += &format!("   split {splits} {:>6.2}", t.median_us);
+                    if best.is_none_or(|(b, _)| t.median_us < b) {
+                        best = Some((t.median_us, cfg));
+                    }
+                }
+                eprintln!("{row}");
             }
+            layers.config = None;
+            let chosen = layers.config_for(nn, k);
+            let mut l = 0;
+            let t = run(&mut || {
+                // Layers 1..=21 (layer 0's qkv has no LayerNorm).
+                l = l % (gpu.layout.layers.len() - 1) + 1;
+                launch(&mut layers, l)
+            })?;
+            layer_total += t.median_us;
+            let (bt, bc) = best.unwrap();
+            eprintln!(
+                "    chosen {chosen}: {:.2} µs rotating through 21 layers' weights, {:.2} TFLOP/s; \
+                 fastest here {bc} ({bt:.2} µs, in L2)",
+                t.median_us,
+                flop / t.median_us / 1e6
+            );
+        }
+        eprintln!(
+            "  one layer's four GEMMs: {layer_total:.1} µs; × {} layers: {:.2} ms",
+            gpu.layout.layers.len(),
+            layer_total * gpu.layout.layers.len() as f64 / 1e3
         );
     }
     Ok(())

@@ -9,7 +9,10 @@ use color_eyre::eyre::ensure;
 use cudarc::driver::{CudaSlice, CudaStream};
 use half::{f16, slice::HalfFloatSliceExt};
 
-use crate::{checkpoint::Checkpoint, prep::fold_layernorm};
+use crate::{
+    checkpoint::Checkpoint,
+    prep::{fold_layernorm, interleave_geglu},
+};
 
 /// Every span starts at a multiple of this many bytes: 16-byte vector loads and `ldmatrix` need
 /// 16, and 128 is a whole cache line.
@@ -45,8 +48,9 @@ pub struct EncoderLayer {
     /// `colsum` for the folded `wqkv`; `None` in layer 0, whose qkv GEMM uses the plain epilogue.
     pub qkv_colsum: Option<Span<f32>>,
     pub wo: Span<f16>,
-    /// The MLP LayerNorm's γ folded in.
+    /// The MLP LayerNorm's γ folded in, rows interleaved for GeGLU (`prep::interleave_geglu`).
     pub wi: Span<f16>,
+    /// `colsum` for the folded `wi`, in the same interleaved order.
     pub wi_colsum: Span<f32>,
     pub wo_mlp: Span<f16>,
     /// Global attention (else sliding window).
@@ -137,9 +141,8 @@ impl HostWeights {
         let emb_norm = f.push(ck.f32(&enc.emb_norm));
         let layers = (enc.layers.iter())
             .map(|l| {
-                // With the tensor-core GEMM: permute the q and k rows for RoPE here, and below
-                // interleave wi's input and gate rows for GeGLU, once the fragment layout fixes
-                // the order. Until then both stay in checkpoint order.
+                // RoPE: permute the q and k rows here. Until then wqkv stays in
+                // checkpoint order.
                 let wqkv = ck.f32(&l.wqkv);
                 let (wqkv, qkv_colsum) = match &l.attn_norm {
                     Some(gamma) => {
@@ -148,13 +151,16 @@ impl HostWeights {
                     }
                     None => (h.push_f32(wqkv), None),
                 };
+                // Folded, then its rows (and their column sums) interleaved for the GEMM's
+                // GeGLU epilogue.
                 let wi = fold_layernorm(ck.f32(&l.wi), ck.f32(&l.mlp_norm));
+                let k = ck.config.hidden;
                 EncoderLayer {
                     wqkv,
                     qkv_colsum,
                     wo: h.push_f32(ck.f32(&l.wo)),
-                    wi: h.push(&wi.w),
-                    wi_colsum: f.push(&wi.colsum),
+                    wi: h.push(&interleave_geglu(&wi.w, k)),
+                    wi_colsum: f.push(&interleave_geglu(&wi.colsum, 1)),
                     wo_mlp: h.push_f32(ck.f32(&l.wo_mlp)),
                     global: l.global,
                 }
@@ -294,7 +300,14 @@ mod tests {
             );
             assert_eq!(f(dst.qkv_colsum.unwrap()), qkv.colsum);
             let wi = fold_layernorm(ck.f32(&src.wi), ck.f32(&src.mlp_norm));
-            assert_eq!(f(dst.wi_colsum), wi.colsum);
+            let k = ck.config.hidden;
+            assert_eq!(f(dst.wi_colsum), interleave_geglu(&wi.colsum, 1));
+            assert_eq!(
+                h(dst.wi),
+                (interleave_geglu(&wi.w, k).iter())
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(h(dst.wo_mlp), f16_of(ck.f32(&src.wo_mlp)));
             assert_eq!(dst.global, src.global);
         }

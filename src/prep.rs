@@ -34,17 +34,29 @@ pub fn fold_layernorm(w: &[f32], gamma: &[f32]) -> FoldedLinear {
     FoldedLinear { w, colsum }
 }
 
+/// Wi's rows (`[n, k]`, n = 2·intermediate: the GELU inputs, then the gates) reordered for the
+/// GEMM's fused GeGLU epilogue. In each 64-row tile, a warp's 32 rows are its four n8 fragments:
+/// fragments 2q and 2q + 1 hold the same 8 output columns' input and gate rows. So packed row
+/// p = 64t + 32h + 16q + 8s + e is source row 32t + 16h + 8q + e (+ intermediate for the gate,
+/// s = 1), and output column 32t + 16h + 8q + e. `k = 1` reorders a per-row vector (colsum).
+pub fn interleave_geglu<T: Copy>(w: &[T], k: usize) -> Vec<T> {
+    let n = w.len() / k;
+    assert!(w.len() == n * k && n.is_multiple_of(64));
+    let inter = n / 2;
+    let mut out = Vec::with_capacity(w.len());
+    for p in 0..n {
+        let (t, h, q, s, e) = (p / 64, (p % 64) / 32, (p % 32) / 16, (p % 16) / 8, p % 8);
+        let src = t * 32 + h * 16 + q * 8 + e + if s == 1 { inter } else { 0 };
+        out.extend_from_slice(&w[src * k..][..k]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use julia_rs::{
-        Model,
-        attn::{Rope, Scratch, attention},
-        matmul::{linear, linear_add},
-        mlp::geglu,
-        sequence::sequence,
-    };
+    use julia_rs::{Model, sequence::sequence};
 
     use super::*;
     use crate::check::rel_err;
@@ -62,70 +74,6 @@ mod tests {
             return None;
         }
         Some(crate::check::reference_model(&dir).unwrap())
-    }
-
-    /// The residual stream entering each layer's attention and MLP LayerNorm, from julia-rs's
-    /// layers (`Model::encode`, which keeps only the final output).
-    fn residuals(model: &Model, tokens: &[u32]) -> Vec<[Vec<f32>; 2]> {
-        let (n, d, inter, eps) = (
-            tokens.len(),
-            model.config.hidden,
-            model.config.intermediate,
-            model.config.norm_eps,
-        );
-        let data = model.data();
-        let mut x = model.embed(tokens);
-        let (mut h, mut o, mut qkv) = (vec![0.0; n * d], vec![0.0; n * d], vec![0.0; n * 3 * d]);
-        let (mut hh, mut m) = (vec![0.0; n * 2 * inter], vec![0.0; n * inter]);
-        let mut s = Scratch::default();
-        let rope_g = Rope::new(model.config.rope_theta_global, n);
-        let rope_l = Rope::new(model.config.rope_theta_local, n);
-        let mut out = vec![];
-        for (l, p) in model
-            .weights
-            .encoder
-            .layers
-            .iter()
-            .zip(&model.packed.encoder)
-        {
-            let before_attn = x.clone();
-            match &l.attn_norm {
-                Some(g) => layernorm_rows(&x, g.as_f32(data), eps, &mut h),
-                None => h.copy_from_slice(&x),
-            }
-            linear(&h, &p.wqkv, None, &mut qkv);
-            let (rope, window) = match l.global {
-                true => (&rope_g, None),
-                false => (&rope_l, Some(model.config.local_window / 2)),
-            };
-            rope.apply(&mut qkv, d);
-            attention(&qkv, n, d, window, &mut o, &mut s);
-            linear_add(&o, &p.wo, None, &mut x);
-            let before_mlp = x.clone();
-            layernorm_rows(&x, l.mlp_norm.as_f32(data), eps, &mut h);
-            linear(&h, &p.wi, None, &mut hh);
-            geglu(&hh, inter, &mut m);
-            linear_add(&m, &p.wo_mlp, None, &mut x);
-            out.push([before_attn, before_mlp]);
-        }
-        out
-    }
-
-    /// Bias-free LayerNorm of each `gamma.len()`-wide row, in f64.
-    fn layernorm_rows(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
-        let k = gamma.len();
-        for (row, out) in x.chunks_exact(k).zip(out.chunks_exact_mut(k)) {
-            let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / k as f64;
-            let var = row
-                .iter()
-                .map(|&v| (f64::from(v) - mean).powi(2))
-                .sum::<f64>()
-                / k as f64;
-            let r = 1.0 / (var + f64::from(eps)).sqrt();
-            for ((o, &v), &g) in out.iter_mut().zip(row).zip(gamma) {
-                *o = ((f64::from(v) - mean) * r * f64::from(g)) as f32;
-            }
-        }
     }
 
     /// `x · wᵀ`, f64 accumulation (`x` is `[n, k]`, `w` `[out, k]`).
@@ -182,7 +130,9 @@ mod tests {
         let req = crate::sample_request();
         let seq = sequence(&model.tokenizer, &req, 1024, 512).unwrap();
         let (d, eps, data) = (model.config.hidden, model.config.norm_eps, model.data());
-        let residuals = residuals(&model, &seq.ids);
+        let residuals: Vec<_> = (crate::check::trace(&model, &seq.ids).into_iter())
+            .map(|t| [t.x_in, t.x_mid])
+            .collect();
         eprintln!("{} tokens", seq.ids.len());
         eprintln!("layer  gemm  |mean|/std   f16       fold      fold, f32 colsum");
         for l in [1, 5, 11, 16, 21] {
@@ -199,7 +149,7 @@ mod tests {
             for (name, x, gamma, w) in gemms {
                 let (gamma, w) = (gamma.as_f32(data), w.as_f32(data));
                 let mut h = vec![0.0; x.len()];
-                layernorm_rows(x, gamma, eps, &mut h);
+                crate::check::layernorm_rows(x, gamma, eps, &mut h);
                 let reference = matmul(&h, w, d);
 
                 let plain = f16_round(&matmul(&f16_round(&h), &f16_round(w), d));
@@ -228,6 +178,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The interleave against the kernel's GeGLU epilogue (kernels/src/main.rs): for block column
+    /// bx, warp column wc = warp & 1, lane pair e0 = (lane & 3)·2 and q < 2, the GELU input is
+    /// packed row cw + 16q + e (fragment j = 2q), the gate cw + 16q + 8 + e (fragment 2q + 1),
+    /// with cw = 64·bx + 32·wc + e0, and the output column 32·bx + 16·wc + e0 + 8q + e.
+    #[test]
+    fn interleave_matches_the_geglu_epilogue() {
+        let (n, inter) = (2304, 1152);
+        let rows: Vec<usize> = interleave_geglu(&(0..n).collect::<Vec<_>>(), 1);
+        let mut seen = vec![false; inter];
+        for bx in 0..n / 64 {
+            for wc in 0..2 {
+                for lane in 0..32 {
+                    let e0 = (lane & 3) * 2;
+                    let cw = 64 * bx + 32 * wc + e0;
+                    for q in 0..2 {
+                        for e in 0..2 {
+                            let col = 32 * bx + 16 * wc + e0 + 8 * q + e;
+                            assert_eq!(rows[cw + 16 * q + e], col, "input of column {col}");
+                            assert_eq!(rows[cw + 16 * q + 8 + e], inter + col, "gate of {col}");
+                            seen[col] = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "every output column is produced");
     }
 
     /// Largest |mean| / std over the rows: how much the fold's cancellation has to cancel.
