@@ -16,4 +16,5 @@ sm_120 = []
 julia-rs = { git = "https://github.com/arnu515/julia-rs", default-features = false }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cublas", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "f16"] }
 half = "2"
+memmap2 = "0.9.11"
 color-eyre = "0.6.5"

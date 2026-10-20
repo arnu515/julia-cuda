@@ -209,6 +209,7 @@ dependencies = [
  "cudarc",
  "half",
  "julia-rs",
+ "memmap2",
 ]
 
 [[package]]

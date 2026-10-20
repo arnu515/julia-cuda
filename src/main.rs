@@ -1,18 +1,25 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use color_eyre::eyre::{Context, bail, ensure};
 use cudarc::{
     driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
-use julia_rs::{ModelPaths, load_model, matmul::Precision};
-
-// Used by the weight upload (next); until then only by its tests.
-#[allow(dead_code)]
+mod checkpoint;
 mod prep;
+// The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
+#[allow(dead_code)]
+mod weights;
+
+use checkpoint::Checkpoint;
+use weights::{GpuWeights, HostWeights};
 
 const USAGE: &str = "usage: julia-cuda [checkpoint dir]
-  Without a checkpoint, only checks that the kernels load and run on GPU 0.";
+  Without a checkpoint, only checks that the kernels load and run on GPU 0. With one, also
+  prepares and uploads the weights, and checks the upload.";
+
+/// Hidden size of the model.
+const D: usize = 384;
 
 /// Generated with `embed_ptx!`.
 struct EmbeddedPtx {
@@ -171,23 +178,38 @@ fn main() -> color_eyre::Result<()> {
         return Ok(());
     };
 
-    let path = |p: &str| dir.join(p);
-    let model = load_model(
-        ModelPaths {
-            safetensors_path: &path("model.safetensors"),
-            encoder_config_json_path: &path("encoder/config.json"),
-            julia_config_json_path: &path("julia_config.json"),
-            tokenizer_json_path: &path("tokenizer/tokenizer.json"),
-            tokenizer_config_json_path: &path("tokenizer/tokenizer_config.json"),
-        },
-        Precision::F32,
-    )?;
-    let c = &model.config;
-    eprintln!(
-        "model: {} layers, hidden {}, intermediate {}",
-        model.weights.encoder.layers.len(),
-        c.hidden,
-        c.intermediate
+    let t = Instant::now();
+    let ck = Checkpoint::open(&dir)?;
+    let c = &ck.config;
+    ensure!(
+        c.hidden == D,
+        "the kernels are built for hidden size {D}, the model's is {}",
+        c.hidden
     );
+    eprintln!(
+        "model: {} layers, hidden {}, intermediate {} ({:.0} ms to open)",
+        c.n_layers,
+        c.hidden,
+        c.intermediate,
+        ms(t)
+    );
+    let t = Instant::now();
+    let host = HostWeights::prepare(&ck);
+    eprintln!(
+        "weights: {:.1} MB f16, {:.1} KB f32 ({:.0} ms to prepare)",
+        (host.f16.len() * 2) as f64 / 1e6,
+        (host.f32.len() * 4) as f64 / 1e3,
+        ms(t)
+    );
+    let (stream, t) = (ctx.default_stream(), Instant::now());
+    let gpu = GpuWeights::upload(&stream, &host)?;
+    stream.synchronize()?;
+    eprintln!("uploaded in {:.0} ms", ms(t));
+    gpu.verify(&stream, &host)?;
+    eprintln!("upload verified: both buffers bit-exact");
     Ok(())
+}
+
+fn ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1e3
 }
