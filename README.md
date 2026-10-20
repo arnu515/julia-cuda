@@ -18,11 +18,14 @@ average), RTX 2080 Ti, one request at a time:
 
 | engine | correct | same answer as julia-rs f32 | mean latency per request |
 | --- | ---: | ---: | ---: |
-| julia-cuda | 1451 | 2000 / 2000 | 2.16 ms (1.95 ms on the GPU) |
-| julia-cuda, layer kernel (`--layer-fused`) | 1451 | 2000 / 2000 | 2.19 ms (1.97 ms on the GPU) |
+| julia-cuda | 1451 | 2000 / 2000 | 2.18 ms (1.97 ms on the GPU) |
+| julia-cuda, layer kernel (`--layer-fused`) | 1450 | 1997 / 2000 | 2.10 ms (1.89 ms on the GPU) |
 | original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms |
 | original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms |
 | julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) |
+
+The layer kernel's three different answers are near-ties (julia-rs's margins 0.34, 0.04 and
+0.04 logits); its mean |Δlogit| to julia-rs is the per-step kernels' (0.0224 vs 0.0225).
 
 ## What runs on the GPU
 
@@ -52,17 +55,27 @@ Wi's rows interleaved so GeGLU's input and gate sit in one thread; RoPE cos/sin 
 
 `gemm_tiled`, a shared-memory GEMM on CUDA cores, is kept as a baseline (`--time`).
 
-The layer kernel (`layer_32` / `layer_64`, by tile height) runs a layer's qkv, attention, wo,
-wi and wo_mlp tasks (the same `gemm_tile` / `attention_task` device functions as the per-step
-kernels) with every block striding over each phase's tasks and a grid barrier between phases;
-cooperative launch, grid = resident blocks. It uses ~206 registers (the attention phase), so 2
-blocks per SM. On the 2080 Ti it is 2% faster than the per-step kernels: the 88 launches it
-saves cost ~0.1 ms, and the barriers still wait for each phase's slowest tile.
+The layer kernel (`layer`) runs a layer's qkv, attention, wo, wi and wo_mlp tasks (the same
+`gemm_tile` / `attention_task` device functions as the per-step kernels) with every block
+striding over each phase's tasks and a grid barrier between phases; cooperative launch, grid =
+resident blocks (2 per SM: ~228 registers, set by attention, and 24.7 KB of shared memory). Each
+phase has its own plan (`forward::LayerPlan`): tile height (32 or 64) and split-K per GEMM, and
+attention's keys split into ranges in global layers. The default plan takes, per GEMM, the
+configuration with the lowest `forward::phase_cost`, a latency model fitted to the 2080 Ti's
+sweeps (a task costs a fixed ~5 µs plus 0.35 µs per K step; the busiest SM decides): on the 2080
+Ti it is within 1.6% of the best plan found by sweeping, at 72 to 607 tokens. Encoder on the
+2080 Ti (`--time`), layer kernel vs per-step kernels: 0.995 vs 0.987 ms at 72 tokens, 1.904 vs
+2.030 at 363, 2.070 vs 2.550 at 448. The gain is filling the GPU (per-phase tile heights and
+splits; the per-step rule switches to 128-row tiles above 400 tokens); the 88 launches saved
+cost about as much as the 88 grid barriers. `--time` prints per-phase profiles from the
+kernel's own timestamps (`prof`, `src/profile.rs`).
 
 ## Layout
 
 - `kernels/`: the device crate (its own workspace, built by `cargo oxide`): `main.rs` (every
   kernel), `gemm.rs` and `attn.rs` (their building blocks), `helpers.rs`.
+- `kernels/src/prof.rs`: the layer kernel's timestamps; `src/profile.rs` turns them into
+  per-phase tables and sweeps the layer kernel's plans (`--time`).
 - `src/main.rs`: PTX selection and loading, the `embed` and `gemm_tiled` launches, the CLI.
 - `src/checkpoint.rs`, `src/weights.rs`, `src/prep.rs`: reading the checkpoint, the weight
   layout and its preparation.
@@ -113,7 +126,9 @@ Diagnostics, on a 72- and a 363-token sample request:
   encoder), all 16 tile × split-K configurations, the head, the whole forward pass. Each check
   has a limit derived from a host emulation of the kernels' arithmetic (`cargo test`).
 - `julia-cuda MODEL_DIR --time`: GPU time per kernel (CUDA events after a warm-up), a sweep of
-  every GEMM configuration, attention, the encoder and the forward pass.
+  every GEMM configuration, attention, the encoder and the forward pass; the layer kernel's
+  plans phase by phase (at 72-607 tokens, with `phase_cost`'s estimates) and its per-phase
+  profiles.
 
 ## Baselines: the original runtime
 
@@ -134,5 +149,5 @@ than the pinned 5.0.0, add `--upstream-encoder`.
 
 - One request at a time, buffers allocated per request; no batching across requests.
 - The head's last layer runs on every row (julia-rs: marker rows only; the results are the same).
-- Attention uses ~190 registers per thread (the GEMMs 56-154), and with it the layer kernel ~206.
+- Attention uses ~214 registers per thread (the GEMMs 70-139), and with it the layer kernel ~228.
 - Laptop GPUs vary in clock speed between and within runs; compare timings on the 2080 Ti.
