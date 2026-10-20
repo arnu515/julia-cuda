@@ -662,6 +662,65 @@ impl EncoderSteps for crate::forward::GpuEncoder<'_> {
     }
 }
 
+/// The persistent layer kernel against julia-rs, and against the per-step
+/// kernels it shares its tasks with: each layer from julia-rs's stream, then the encoder chained
+/// from `x0` (embed's output), both ways. Leaves `g` on the per-step kernels.
+pub fn layer_kernel(
+    g: &mut crate::forward::GpuEncoder,
+    traces: &[LayerTrace],
+    x0: &cudarc::driver::CudaSlice<f16>,
+) -> color_eyre::Result<()> {
+    let (_, bm, grid, splits) = g.layer_kernel()?;
+    let n = g.rows();
+    eprintln!(
+        "the layer kernel (one launch per layer), {n} tokens: {bm}-row tiles, {grid} blocks, \
+         split-K {} for wo and {} for wo_mlp (relative error of the stream after each layer)",
+        splits[0], splits[1]
+    );
+    let mut per_layer = 0f64;
+    for (l, t) in traces.iter().enumerate() {
+        g.set_stream(&to_f16(&t.x_in))?;
+        g.launch_layer_fused(l)?;
+        per_layer = per_layer.max(rel_err(&to_f32(&g.stream.clone_dtoh(&g.x)?), &t.x_out));
+    }
+    let mut chain = |fused: bool| -> color_eyre::Result<Vec<Vec<f16>>> {
+        g.fused = fused;
+        g.stream.memcpy_dtod(x0, &mut g.x)?;
+        (0..traces.len())
+            .map(|l| {
+                g.launch_layer(l)?;
+                Ok(g.stream.clone_dtoh(&g.x)?)
+            })
+            .collect()
+    };
+    let steps = chain(false)?;
+    let fused = chain(true)?;
+    g.fused = false;
+    eprintln!("  layer   chained: vs julia-rs   vs the per-step kernels");
+    let (mut worst_ref, mut worst_steps) = (0f64, 0f64);
+    for (l, ((x, s), t)) in fused.iter().zip(&steps).zip(traces).enumerate() {
+        let (r, d) = (
+            rel_err(&to_f32(x), &t.x_out),
+            rel_err(&to_f32(x), &to_f32(s)),
+        );
+        eprintln!("  {l:5}   {r:.2e}             {d:.2e}");
+        (worst_ref, worst_steps) = (worst_ref.max(r), worst_steps.max(d));
+    }
+    eprintln!(
+        "  worst: each layer from julia-rs's stream {per_layer:.2e}; chained {worst_ref:.2e} vs \
+         julia-rs, {worst_steps:.2e} vs the per-step kernels"
+    );
+    // The same tasks as the per-step kernels; only the order of the row statistics' atomic
+    // additions differs, so the two chains drift apart like any two runs.
+    ensure!(
+        per_layer < MAX_ERR.x_out
+            && worst_ref < MAX_ERR_CHAINED.x_out
+            && worst_steps < MAX_ERR_CHAINED.x_out,
+        "the layer kernel is off"
+    );
+    Ok(())
+}
+
 /// Every configuration (shape × split-K) on one layer's GEMMs, each from julia-rs's stream
 /// entering that layer: shape- and split-specific bugs show here, while `layers` runs only the
 /// chosen configurations.

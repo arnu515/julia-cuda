@@ -156,13 +156,19 @@ pub fn choose(m: usize, n: usize, k: usize, sms: usize) -> Config {
         201..=400 => Shape::S64,
         _ => Shape::S128w8,
     };
-    let tiles = (n / 64) * m.div_ceil(shape.bm());
-    // Strictly more: at 2·tiles == sms (wo and wo_mlp on the 4070's 36 SMs) splitting wins.
-    let splits = if 2 * tiles > sms { 1 } else { 4 };
     Config {
         shape,
-        splits: splits.min((k / 32 / 3).max(1) as u32),
+        splits: splits(m, n, k, shape.bm(), sms),
     }
+}
+
+/// `choose`'s split-K count for tiles of `bm` rows: none while there are more than half as many
+/// tiles as SMs, else 4, keeping each split ≥ 3 K steps.
+pub fn splits(m: usize, n: usize, k: usize, bm: usize, sms: usize) -> u32 {
+    let tiles = (n / 64) * m.div_ceil(bm);
+    // Strictly more: at 2·tiles == sms (wo and wo_mlp on the 4070's 36 SMs) splitting wins.
+    let splits = if 2 * tiles > sms { 1 } else { 4 };
+    splits.min((k / 32 / 3).max(1) as u32)
 }
 
 /// The 32 GEMM kernels (4 shapes × 8 epilogues).
@@ -193,8 +199,8 @@ const MAX_N: usize = 2304;
 /// Split-K scratch: a BM × 64 f32 partial tile per (tile, split), and an arrival counter per
 /// tile (zero between launches: the last block of a tile resets it).
 pub struct Scratch {
-    ws: CudaSlice<f32>,
-    counters: CudaSlice<u32>,
+    pub(crate) ws: CudaSlice<f32>,
+    pub(crate) counters: CudaSlice<u32>,
 }
 
 impl Scratch {
@@ -240,7 +246,7 @@ pub struct Gemm<'a, 'b> {
 
 /// The raw device address of a buffer, for the kernels' pointer parameters (`res` aliases `c`,
 /// which cudarc's typed arguments can't express).
-fn ptr<T>(stream: &Arc<CudaStream>, x: &impl DevicePtr<T>) -> u64 {
+pub(crate) fn ptr<T>(stream: &Arc<CudaStream>, x: &impl DevicePtr<T>) -> u64 {
     x.device_ptr(stream).0
 }
 

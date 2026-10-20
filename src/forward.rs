@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use color_eyre::eyre::ensure;
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use half::f16;
 
 use crate::{
@@ -32,6 +33,12 @@ pub struct GpuEncoder<'a> {
     pub m: CudaSlice<f16>,
     pub stats_attn: CudaSlice<f32>,
     pub stats_mlp: CudaSlice<f32>,
+    /// Run each layer as one persistent launch (`layer_32` / `layer_64`)
+    /// instead of five.
+    pub fused: bool,
+    /// The layer kernel's grid-barrier counter, and the arrivals counted so far.
+    pub bar: CudaSlice<u32>,
+    pub bar_count: u32,
 }
 
 impl<'a> GpuEncoder<'a> {
@@ -62,11 +69,14 @@ impl<'a> GpuEncoder<'a> {
             m: stream.alloc_zeros(n * inter)?,
             stats_attn: stream.alloc_zeros(2 * n)?,
             stats_mlp: stream.alloc_zeros(2 * n)?,
+            fused: false,
+            bar: stream.alloc_zeros(1)?,
+            bar_count: 0,
             x,
         })
     }
 
-    fn rows(&self) -> usize {
+    pub fn rows(&self) -> usize {
         self.x.len() / D
     }
 
@@ -125,13 +135,120 @@ impl<'a> GpuEncoder<'a> {
         )
     }
 
-    /// Queues all of layer `l`: qkv, attention, wo, wi, wo_mlp.
+    /// Queues all of layer `l`: qkv, attention, wo, wi, wo_mlp; as one launch if `fused`.
     pub fn launch_layer(&mut self, l: usize) -> color_eyre::Result<()> {
+        if self.fused {
+            return self.launch_layer_fused(l);
+        }
         self.launch_qkv(l)?;
         self.launch_attention(l)?;
         self.launch_wo(l)?;
         self.launch_wi(l)?;
         self.launch_wo_mlp(l)
+    }
+
+    /// The persistent layer kernel for this token count, its tile height, and the grid: as many
+    /// blocks as fit on the GPU at once, but no more than the largest phase has tasks.
+    pub fn layer_kernel(&self) -> color_eyre::Result<(&'a CudaFunction, usize, u32, [u32; 2])> {
+        let n = self.rows();
+        let inter = self.m.len() / n;
+        // The tile height choose() would pick, of the two the layer kernel has.
+        let ((f, per_sm), bm) = match gemm::choose(n, 3 * D, D, self.sms).shape {
+            gemm::Shape::S32 => (&self.kernels.layer_32, 32),
+            _ => (&self.kernels.layer_64, 64),
+        };
+        let splits = [
+            gemm::splits(n, D, D, bm, self.sms),
+            gemm::splits(n, D, inter, bm, self.sms),
+        ];
+        let rows = n.div_ceil(bm);
+        let tasks = [
+            (3 * D / 64) * rows,
+            n.div_ceil(64) * (D / 64),
+            (D / 64) * rows * splits[0] as usize,
+            (2 * inter / 64) * rows,
+            (D / 64) * rows * splits[1] as usize,
+        ];
+        let grid = (self.sms * per_sm).min(tasks.into_iter().max().unwrap()) as u32;
+        Ok((f, bm, grid, splits))
+    }
+
+    /// Queues layer `l` as one cooperative launch of the persistent layer kernel.
+    pub fn launch_layer_fused(&mut self, l: usize) -> color_eyre::Result<()> {
+        let n = self.rows();
+        let inter = self.m.len() / n;
+        let (f, bm, grid, splits) = self.layer_kernel()?;
+        let sc = self.scratch;
+        let tiles = (D / 64) * n.div_ceil(bm);
+        ensure!(
+            tiles * 4 * bm * 64 <= sc.ws.len() && tiles <= sc.counters.len(),
+            "layer: the split-K scratch is too small for {n} tokens"
+        );
+        let lay = &self.w.layout.layers[l];
+        let s = self.stream;
+        let rope = match lay.global {
+            true => self.w.layout.rope_global,
+            false => self.w.layout.rope_local,
+        };
+        ensure!(
+            rope.len >= n * 64,
+            "layer: the RoPE table is too short for {n} positions"
+        );
+        let (f16s, f32s) = (&self.w.f16, &self.w.f32);
+        let wptr = |r: std::ops::Range<usize>| gemm::ptr(s, &f16s.slice(r));
+        let vptr = |r: std::ops::Range<usize>| gemm::ptr(s, &f32s.slice(r));
+        let args: [u64; 16] = [
+            gemm::ptr(s, &self.x),
+            gemm::ptr(s, &self.qkv),
+            gemm::ptr(s, &self.o),
+            gemm::ptr(s, &self.m),
+            gemm::ptr(s, &self.stats_attn),
+            gemm::ptr(s, &self.stats_mlp),
+            gemm::ptr(s, &sc.ws),
+            gemm::ptr(s, &sc.counters),
+            gemm::ptr(s, &self.bar),
+            wptr(lay.wqkv.range()),
+            lay.qkv_colsum.map_or(0, |c| vptr(c.range())),
+            vptr(rope.range()),
+            wptr(lay.wo.range()),
+            wptr(lay.wi.range()),
+            vptr(lay.wi_colsum.range()),
+            wptr(lay.wo_mlp.range()),
+        ];
+        let window = if lay.global { 0 } else { self.window as u32 };
+        let (n32, inter32, base) = (n as u32, inter as u32, self.bar_count);
+        let mut launch = s.launch_builder(f);
+        // layer_*(x, qkv, o, mbuf, stats_attn, stats_mlp, ws, counters, bar, bar_base, wqkv,
+        // qkv_colsum, rope, wo, wi, wi_colsum, wo_mlp, m, inter, eps, window, splits_wo,
+        // splits_wo_mlp)
+        for a in &args[..9] {
+            launch.arg(a);
+        }
+        launch.arg(&base);
+        for a in &args[9..16] {
+            launch.arg(a);
+        }
+        launch
+            .arg(&n32)
+            .arg(&inter32)
+            .arg(&self.eps)
+            .arg(&window)
+            .arg(&splits[0])
+            .arg(&splits[1]);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the buffers are the encoder's ([n, D] x and o, [n, 3D] qkv, [n, inter] m, 2n
+        // statistics each) and the weights' spans for layer l, all 16-byte aligned; the split-K
+        // scratch and the RoPE table are big enough (checked); qkv_colsum is null only in
+        // layer 0, which has no LayerNorm. A cooperative launch with at most the resident
+        // number of blocks, so the grid barriers can't deadlock; 128 threads, as the kernel
+        // assumes.
+        unsafe { launch.launch_cooperative(cfg) }?;
+        self.bar_count = self.bar_count.wrapping_add(4 * grid);
+        Ok(())
     }
 
     /// Queues layer `l`'s Wo GEMM (stream += o · Woᵀ).

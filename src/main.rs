@@ -3,8 +3,8 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use color_eyre::eyre::{Context, bail, ensure};
 use cudarc::{
     driver::{
-        CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg,
-        sys::CUdevice_attribute,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, LaunchConfig,
+        PushKernelArg, sys::CUdevice_attribute,
     },
     nvrtc::Ptx,
 };
@@ -27,11 +27,12 @@ use julia_rs::{
 use weights::{GpuWeights, HostWeights};
 
 const USAGE: &str =
-    "usage: julia-cuda [checkpoint dir [--max-length N] [--head-length N]] < requests.jsonl
+    "usage: julia-cuda [checkpoint dir [--max-length N] [--head-length N] [--layer-fused]] < requests.jsonl
        julia-cuda checkpoint dir [--check] [--time]
   Without a checkpoint, only checks that the kernels load on GPU 0. With one, answers the requests
   on stdin, one JSON object per line, as julia-rs does (same fields, same order), and reports the
   latency on stderr. --max-length and --head-length are julia-rs's (default 8192 and 512).
+  --layer-fused runs each encoder layer as one persistent launch instead of five.
   --check runs the kernels on two sample requests instead, and compares every step with julia-rs
   (the weight upload, each kernel, each layer, the head, the whole forward pass).
   --time  measures each kernel's GPU time on them (CUDA events, after warm-up).";
@@ -99,6 +100,10 @@ pub struct Kernels {
     /// The tensor-core GEMMs.
     gemm: gemm::GemmKernels,
     attention: CudaFunction,
+    /// The persistent layer kernels, with 32- and 64-row tiles, and how many
+    /// of their 128-thread blocks fit on an SM at once.
+    layer_32: (CudaFunction, usize),
+    layer_64: (CudaFunction, usize),
     norm_add: CudaFunction,
     score: CudaFunction,
 }
@@ -135,9 +140,19 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
         gemm_tiled: module.load_function("gemm_tiled")?,
         gemm: gemm::GemmKernels::load(&module)?,
         attention: module.load_function("attention")?,
+        layer_32: layer_kernel(&module, "layer_32")?,
+        layer_64: layer_kernel(&module, "layer_64")?,
         norm_add: module.load_function("norm_add")?,
         score: module.load_function("score")?,
     })
+}
+
+/// A persistent layer kernel and its resident blocks per SM (for the cooperative launch's grid).
+fn layer_kernel(module: &Arc<CudaModule>, name: &str) -> color_eyre::Result<(CudaFunction, usize)> {
+    let f = module.load_function(name)?;
+    let per_sm = f.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? as usize;
+    ensure!(per_sm > 0, "{name} doesn't fit on an SM");
+    Ok((f, per_sm))
 }
 
 /// Hidden size of the model.
@@ -320,6 +335,7 @@ fn main() -> color_eyre::Result<()> {
     };
     let (mut check, mut time) = (false, false);
     let (mut max_length, mut head_length) = (None, DEFAULT_HEAD_LENGTH);
+    let mut layer_fused = false;
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
         let mut number = || -> color_eyre::Result<usize> {
@@ -331,6 +347,7 @@ fn main() -> color_eyre::Result<()> {
             "--time" => time = true,
             "--max-length" => max_length = Some(number()?),
             "--head-length" => head_length = number()?,
+            "--layer-fused" => layer_fused = true,
             _ => bail!(USAGE),
         }
     }
@@ -375,7 +392,16 @@ fn main() -> color_eyre::Result<()> {
     let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
     if !check && !time {
         let max_length = max_length.unwrap_or(c.max_positions);
-        return serve::serve(&stream, &kernels, &gpu, &ck, sms, max_length, head_length);
+        return serve::serve(
+            &stream,
+            &kernels,
+            &gpu,
+            &ck,
+            sms,
+            max_length,
+            head_length,
+            layer_fused,
+        );
     }
 
     let seq = sequence(
@@ -489,6 +515,23 @@ fn main() -> color_eyre::Result<()> {
             let logits = h.run(&enc.x, s.qtype as usize)?;
             check::forward(&model, &s.ids, s.qtype, &s.markers, &logits)?;
         }
+
+        // The persistent layer kernel, then the forward pass with it.
+        for (s, t, enc, h, x0) in [
+            (&seq, &traces_short, &mut layers, &mut head_short, &x),
+            (&long, &traces, &mut layers_long, &mut head_long, &x_long),
+        ] {
+            check::layer_kernel(enc, t, x0)?;
+            enc.fused = true;
+            stream.memcpy_dtod(x0, &mut enc.x)?;
+            for l in 0..gpu.layout.layers.len() {
+                enc.launch_layer(l)?;
+            }
+            enc.fused = false;
+            let logits = h.run(&enc.x, s.qtype as usize)?;
+            eprint!("with the layer kernel: ");
+            check::forward(&model, &s.ids, s.qtype, &s.markers, &logits)?;
+        }
     }
 
     if time {
@@ -596,15 +639,23 @@ fn main() -> color_eyre::Result<()> {
                     t.min_us, t.median_us
                 );
             }
-            let t = timing::time(&stream, 2, 10, 5, &mut || {
-                (0..n_layers).try_for_each(|l| g.launch_layer(l))
-            })?;
-            eprintln!(
-                "  encoder ({n_layers} layers, {} launches), {tokens} tokens: {:.3} ms (fastest {:.3})",
-                5 * n_layers,
-                t.median_us / 1e3,
-                t.min_us / 1e3
-            );
+            for fused in [false, true] {
+                g.fused = fused;
+                let t = timing::time(&stream, 2, 10, 5, &mut || {
+                    (0..n_layers).try_for_each(|l| g.launch_layer(l))
+                })?;
+                let (launches, how) = match fused {
+                    false => (5 * n_layers, "per-step kernels"),
+                    true => (n_layers, "the layer kernel"),
+                };
+                eprintln!(
+                    "  encoder, {how} ({launches} launches), {tokens} tokens: {:.3} ms \
+                     (fastest {:.3})",
+                    t.median_us / 1e3,
+                    t.min_us / 1e3
+                );
+            }
+            g.fused = false;
         }
         // The head, and the whole forward pass: embed, the encoder, the head (from token ids on
         // the GPU to logits on the GPU; no copies).
@@ -621,18 +672,27 @@ fn main() -> color_eyre::Result<()> {
                 t.min_us, t.median_us
             );
             let mut x_in = stream.clone_dtod(&enc.x)?;
-            let t = timing::time(&stream, 2, 10, 5, &mut || {
-                embed_into(&stream, &kernels, &gpu, ids, c.norm_eps, &mut x_in)?;
-                stream.memcpy_dtod(&x_in, &mut enc.x)?;
-                (0..n_layers).try_for_each(|l| enc.launch_layer(l))?;
-                h.launch_all(&enc.x, s.qtype as usize)
-            })?;
-            eprintln!(
-                "  forward pass ({} launches + a copy), {tokens} tokens: {:.3} ms (fastest {:.3})",
-                1 + 5 * n_layers + launches,
-                t.median_us / 1e3,
-                t.min_us / 1e3
-            );
+            for fused in [false, true] {
+                enc.fused = fused;
+                let t = timing::time(&stream, 2, 10, 5, &mut || {
+                    embed_into(&stream, &kernels, &gpu, ids, c.norm_eps, &mut x_in)?;
+                    stream.memcpy_dtod(&x_in, &mut enc.x)?;
+                    (0..n_layers).try_for_each(|l| enc.launch_layer(l))?;
+                    h.launch_all(&enc.x, s.qtype as usize)
+                })?;
+                let (encoder, how) = match fused {
+                    false => (5 * n_layers, "per-step kernels"),
+                    true => (n_layers, "the layer kernel"),
+                };
+                eprintln!(
+                    "  forward pass, {how} ({} launches + a copy), {tokens} tokens: {:.3} ms \
+                     (fastest {:.3})",
+                    1 + encoder + launches,
+                    t.median_us / 1e3,
+                    t.min_us / 1e3
+                );
+            }
+            enc.fused = false;
         }
     }
     Ok(())

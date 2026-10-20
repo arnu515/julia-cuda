@@ -5,9 +5,11 @@ Rust ([cuda-oxide](https://github.com/NVIDIA/cuda-rust)) and a host on
 [cudarc](https://github.com/coreylowman/cudarc). [julia-rs](https://github.com/arnu515/julia-rs)
 (the CPU engine) is the reference: checkpoint loading, tokenizer, request format and f32 outputs.
 
-This is the **unfused reference**: every step of the forward pass is its own kernel launch,
-with the fusions that fit in a GEMM epilogue. A persistent kernel per layer, then one for the
-whole model, are to be measured against it.
+It has two encoder paths. The **unfused reference** (tag
+`unfused-reference`): every step of the forward pass is its own kernel launch, with the fusions
+that fit in a GEMM epilogue. The **layer kernel** (`--layer-fused`): each encoder
+layer as one persistent launch, its five steps as phases with grid barriers in between, running
+the same tile code. One persistent kernel for the whole model is next.
 
 ## Results
 
@@ -17,6 +19,7 @@ average), RTX 2080 Ti, one request at a time:
 | engine | correct | same answer as julia-rs f32 | mean latency per request |
 | --- | ---: | ---: | ---: |
 | julia-cuda | 1451 | 2000 / 2000 | 2.16 ms (1.95 ms on the GPU) |
+| julia-cuda, layer kernel (`--layer-fused`) | 1451 | 2000 / 2000 | 2.19 ms (1.97 ms on the GPU) |
 | original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms |
 | original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms |
 | julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) |
@@ -48,6 +51,13 @@ in the head) folded into the next linear with per-output column sums
 Wi's rows interleaved so GeGLU's input and gate sit in one thread; RoPE cos/sin tables.
 
 `gemm_tiled`, a shared-memory GEMM on CUDA cores, is kept as a baseline (`--time`).
+
+The layer kernel (`layer_32` / `layer_64`, by tile height) runs a layer's qkv, attention, wo,
+wi and wo_mlp tasks (the same `gemm_tile` / `attention_task` device functions as the per-step
+kernels) with every block striding over each phase's tasks and a grid barrier between phases;
+cooperative launch, grid = resident blocks. It uses ~206 registers (the attention phase), so 2
+blocks per SM. On the 2080 Ti it is 2% faster than the per-step kernels: the 88 launches it
+saves cost ~0.1 ms, and the barriers still wait for each phase's slowest tile.
 
 ## Layout
 
@@ -84,7 +94,7 @@ Tested on the 2080 Ti and the 4070; sm_80 and sm_120 build but haven't run.
 ## Run
 
 ```sh
-julia-cuda MODEL_DIR --max-length 1024 --head-length 512 < requests.jsonl > results.jsonl
+julia-cuda MODEL_DIR --max-length 1024 --head-length 512 [--layer-fused] < requests.jsonl > results.jsonl
 ```
 
 One request per line, julia-rs's format and result fields (`logits`, `probabilities`,
@@ -124,5 +134,5 @@ than the pinned 5.0.0, add `--upstream-encoder`.
 
 - One request at a time, buffers allocated per request; no batching across requests.
 - The head's last layer runs on every row (julia-rs: marker rows only; the results are the same).
-- Attention uses ~170 registers per thread (the GEMMs 56-154).
+- Attention uses ~190 registers per thread (the GEMMs 56-154), and with it the layer kernel ~206.
 - Laptop GPUs vary in clock speed between and within runs; compare timings on the 2080 Ti.

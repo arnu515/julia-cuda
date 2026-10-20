@@ -13,18 +13,14 @@
 //! split-K to be balanced), all rows 16-byte aligned. Rows of `a` past m are read as zeros and
 //! never stored.
 
-use core::ptr::addr_of_mut;
-
 use cuda_device::shared::cvta_generic_to_shared_u32;
 use cuda_device::vector::{F32x4, U32x4};
-use cuda_device::{SharedArray, device, ptx_asm, thread};
+use cuda_device::{device, ptx_asm, thread};
 
 /// K step.
 pub const BK: u32 = 32;
 /// A 64 × 32 f16 tile (the W tile, and the A tile of the 64-row shapes).
 pub const TILE: usize = 64 * 32;
-/// A-tile stride per pipeline stage (the largest BM, 128 rows × 32).
-pub const ATILE: usize = 128 * 32;
 
 /// Element offset of (row, 16-byte chunk) in a swizzled [rows][32] tile: chunk c of row r is
 /// stored at chunk c ^ ((r / 2) % 4), so the 8 rows an `ldmatrix` reads hit 8 different 16-byte
@@ -166,6 +162,48 @@ pub unsafe fn ln_stats(stats: *const f32, r: u32, k: u32, eps: f32) -> (f32, f32
     (mean, rsqrt(if var > 0.0 { var } else { 0.0 } + eps))
 }
 
+/// Which output tile (and K split) a block computes: its own grid position in the per-GEMM
+/// kernels (`of_block`), or a task index's in the persistent layer kernel.
+#[derive(Clone, Copy)]
+pub struct Tile {
+    /// Column tile (64 output columns) and row tile (BM rows).
+    pub bx: u32,
+    pub by: u32,
+    /// This block's K split, of `splits`.
+    pub z: u32,
+    pub splits: u32,
+    /// Column tiles per row of tiles (n / 64).
+    pub tiles_x: u32,
+}
+
+impl Tile {
+    /// The tile of the launch grid (n/64, ⌈m/BM⌉, splits) at this block.
+    #[inline(always)]
+    pub fn of_block() -> Self {
+        Self {
+            bx: thread::blockIdx_x(),
+            by: thread::blockIdx_y(),
+            z: thread::blockIdx_z(),
+            splits: thread::gridDim_z(),
+            tiles_x: thread::gridDim_x(),
+        }
+    }
+
+    /// Task `t` of a GEMM with `tiles_x` column tiles and `splits` K splits: splits of one tile
+    /// are adjacent tasks, so they run at the same time.
+    #[inline(always)]
+    pub fn of_task(t: u32, tiles_x: u32, splits: u32) -> Self {
+        let tile = t / splits;
+        Self {
+            bx: tile % tiles_x,
+            by: tile / tiles_x,
+            z: t % splits,
+            splits,
+            tiles_x,
+        }
+    }
+}
+
 /// One BK-deep step of this warp's 16·MI × 32 piece, from the current shared tiles.
 #[device]
 pub fn compute<const MI: usize>(acc: &mut [[[f32; 4]; 4]; MI], a_s: *const u16, w_s: *const u16) {
@@ -211,6 +249,7 @@ pub fn load_regs<const MI: usize, const WR: u32>(
     m: u32,
     k: u32,
     k0: u32,
+    t: Tile,
 ) -> [U32x4; 6] {
     let mut v = [U32x4([0; 4]); 6];
     let (tid, nt, bm) = (thread::threadIdx_x(), 64 * WR, 16 * MI as u32 * WR);
@@ -218,7 +257,7 @@ pub fn load_regs<const MI: usize, const WR: u32>(
     for h in 0..MI {
         let ch = tid + h as u32 * nt;
         let (row, col) = (ch >> 2, k0 + (ch & 3) * 8);
-        let ar = thread::blockIdx_y() * bm + row;
+        let ar = t.by * bm + row;
         if ar < m {
             // SAFETY: row ar < m, col + 8 <= k; 16-byte aligned (k and col are multiples of 8,
             // and the host passes 16-byte aligned buffers).
@@ -230,7 +269,7 @@ pub fn load_regs<const MI: usize, const WR: u32>(
         if (h as u32) < 4 / WR {
             let ch = tid + h as u32 * nt;
             let (row, col) = (ch >> 2, k0 + (ch & 3) * 8);
-            let wr = thread::blockIdx_x() * 64 + row;
+            let wr = t.bx * 64 + row;
             // SAFETY: as for A, with wr < n because n is a multiple of 64.
             v[4 + h] = unsafe { *(w.add(wr as usize * k as usize + col as usize) as *const U32x4) };
         }
@@ -258,15 +297,22 @@ pub fn store_regs<const MI: usize, const WR: u32>(v: &[U32x4; 6], a_s: *mut u16,
     }
 }
 
-/// This block's K-step range [kt0, kt1) under split-K (gridDim.z splits).
+/// Tile `t`'s K-step range [kt0, kt1) under split-K.
 #[inline(always)]
-pub fn k_range(k: u32) -> (u32, u32) {
-    let (nk, z, splits) = (k / BK, thread::blockIdx_z(), thread::gridDim_z());
-    (z * nk / splits, (z + 1) * nk / splits)
+pub fn k_range(k: u32, t: Tile) -> (u32, u32) {
+    let nk = k / BK;
+    (t.z * nk / t.splits, (t.z + 1) * nk / t.splits)
 }
 
-/// The register-prefetch main loop. Not #[device]: LLVM must inline it, or the accumulator goes
-/// through local memory.
+/// Shared memory (u16 elements) `mainloop` needs: two stages of the BM × 32 A tile and of the
+/// 64 × 32 W tile, A's first.
+pub const fn smem_halves(bm: usize) -> usize {
+    2 * (bm * BK as usize + TILE)
+}
+
+/// The register-prefetch main loop for tile `t`, through the shared buffer `smem` (at least
+/// `smem_halves(BM)` u16, 16-byte aligned). Not #[device]: LLVM must inline it, or the
+/// accumulator goes through local memory.
 #[inline(always)]
 pub fn mainloop<const MI: usize, const WR: u32>(
     acc: &mut [[[f32; 4]; 4]; MI],
@@ -274,28 +320,30 @@ pub fn mainloop<const MI: usize, const WR: u32>(
     w: *const u16,
     m: u32,
     k: u32,
+    t: Tile,
+    smem: *mut u16,
 ) {
-    static mut AS: SharedArray<u16, { 2 * ATILE }, 128> = SharedArray::UNINIT;
-    static mut WS: SharedArray<u16, { 2 * TILE }, 128> = SharedArray::UNINIT;
-    let (a_s, w_s) = (addr_of_mut!(AS) as *mut u16, addr_of_mut!(WS) as *mut u16);
-    let (kt0, kt1) = k_range(k);
-    let mut v = load_regs::<MI, WR>(a, w, m, k, kt0 * BK);
+    let astage = 16 * MI * WR as usize * BK as usize;
+    // SAFETY: the A stages, then the W stages, inside `smem` (the caller's size).
+    let (a_s, w_s) = (smem, unsafe { smem.add(2 * astage) });
+    let (kt0, kt1) = k_range(k, t);
+    let mut v = load_regs::<MI, WR>(a, w, m, k, kt0 * BK, t);
     store_regs::<MI, WR>(&v, a_s, w_s);
     thread::sync_threads();
     let mut kt = kt0;
     while kt < kt1 {
         if kt + 1 < kt1 {
-            v = load_regs::<MI, WR>(a, w, m, k, (kt + 1) * BK);
+            v = load_regs::<MI, WR>(a, w, m, k, (kt + 1) * BK, t);
         }
         let cur = ((kt - kt0) & 1) as usize;
         // SAFETY: stage `cur` of the two-stage buffers.
-        compute::<MI>(acc, unsafe { a_s.add(cur * ATILE) }, unsafe {
+        compute::<MI>(acc, unsafe { a_s.add(cur * astage) }, unsafe {
             w_s.add(cur * TILE)
         });
         if kt + 1 < kt1 {
             let nxt = 1 - cur;
             // The other stage: nobody reads it this step (the barrier below ends the step).
-            store_regs::<MI, WR>(&v, unsafe { a_s.add(nxt * ATILE) }, unsafe {
+            store_regs::<MI, WR>(&v, unsafe { a_s.add(nxt * astage) }, unsafe {
                 w_s.add(nxt * TILE)
             });
         }
@@ -311,27 +359,27 @@ pub fn mainloop<const MI: usize, const WR: u32>(
 ///
 /// # Safety
 /// With more than one split, `ws` must hold BM·64 floats per (tile, split) and `counters` one
-/// zeroed u32 per tile.
+/// zeroed u32 per tile; `last` is one u32 of shared memory.
 #[device]
 pub unsafe fn split_reduce<const MI: usize, const WR: u32>(
     acc: &mut [[[f32; 4]; 4]; MI],
     ws: *mut f32,
     counters: *mut u32,
+    t: Tile,
+    last: *mut u32,
 ) -> bool {
-    let splits = thread::gridDim_z();
+    let splits = t.splits;
     if splits == 1 {
         return true;
     }
-    static mut LAST: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-    let last = addr_of_mut!(LAST) as *mut u32;
     let (tid, nt) = (thread::threadIdx_x(), (64 * WR) as usize);
-    let tile = thread::blockIdx_y() * thread::gridDim_x() + thread::blockIdx_x();
+    let tile = t.by * t.tiles_x + t.bx;
     // Partial of split z: [4·MI fragments][64·WR threads] of F32x4 (BM × 64 floats), so the
     // stores coalesce.
     let part = |z: u32| unsafe {
         ws.add((tile * splits + z) as usize * 1024 * MI * WR as usize) as *mut F32x4
     };
-    let mine = part(thread::blockIdx_z());
+    let mine = part(t.z);
     #[unroll]
     for i in 0..MI {
         #[unroll]
@@ -382,4 +430,33 @@ pub unsafe fn split_reduce<const MI: usize, const WR: u32>(
         z += 1;
     }
     true
+}
+
+/// A barrier across the whole grid, the `target`-th arrival count of `bar`: every block adds 1
+/// and waits until the count reaches `target` (the caller's running total, so the counter never
+/// resets; compared with wrap-around). As cooperative groups' grid sync: fences on both sides, so
+/// everything written before is visible to every block after, through ordinary loads.
+///
+/// # Safety
+/// Every thread of every block must call it the same number of times, and all blocks must be
+/// resident at once (a cooperative launch); `bar` is a u32 in global memory.
+#[inline(always)]
+pub unsafe fn grid_sync(bar: *mut u32, target: u32) {
+    thread::sync_threads();
+    if thread::threadIdx_x() == 0 {
+        // SAFETY: the caller guarantees `bar`.
+        unsafe {
+            ptx_asm!("fence.acq_rel.gpu;", clobber("memory"));
+            ptx_asm!("red.release.gpu.global.add.u32 [%0], 1;", in("l") bar, clobber("memory"));
+            let mut seen: u32;
+            loop {
+                ptx_asm!("ld.acquire.gpu.global.u32 %0, [%1];", out("=r") seen, in("l") bar, clobber("memory"));
+                if seen.wrapping_sub(target) as i32 >= 0 {
+                    break;
+                }
+            }
+            ptx_asm!("fence.acq_rel.gpu;", clobber("memory"));
+        }
+    }
+    thread::sync_threads();
 }

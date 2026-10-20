@@ -22,8 +22,9 @@ use crate::{
 };
 
 /// Answers every request on stdin, one at a time: tokenize, upload the ids, embed, the encoder
-/// and the head (124 launches), download the logits. Buffers are allocated per request (stream-
+/// and the head (124 launches, or 36 with `layer_fused`), download the logits. Buffers are allocated per request (stream-
 /// ordered allocations, outside the timed GPU span).
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     stream: &Arc<CudaStream>,
     kernels: &Kernels,
@@ -32,6 +33,7 @@ pub fn serve(
     sms: usize,
     max_length: usize,
     head_length: usize,
+    layer_fused: bool,
 ) -> color_eyre::Result<()> {
     let c = &ck.config;
     ensure!(
@@ -72,6 +74,7 @@ pub fn serve(
             stream.alloc_zeros(n * D)?,
             c.intermediate,
         )?;
+        enc.fused = layer_fused;
         let mut head = GpuHead::new(stream, kernels, &scratch, gpu, c.norm_eps, sms, n, &markers)?;
 
         let start = stream.record_event(timing)?;
