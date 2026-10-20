@@ -19,7 +19,6 @@ pub struct Checkpoint {
     pub config: ModelConfig,
     /// Where each tensor is in the data section (shapes checked against `config`).
     pub tensors: Weights,
-    #[expect(dead_code)] // read by the sequence builder, next
     pub tokenizer: Tokenizer,
 }
 

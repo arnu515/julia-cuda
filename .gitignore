@@ -4,3 +4,6 @@ ptx/
 *.nsys-rep
 .direnv
 dist/
+# From building the kernels directly (cargo oxide build in kernels/) rather than with make.
+kernels/*.ptx
+kernels/*.ll

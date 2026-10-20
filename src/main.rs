@@ -2,9 +2,11 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use color_eyre::eyre::{Context, bail, ensure};
 use cudarc::{
-    driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg},
+    driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg},
     nvrtc::Ptx,
 };
+
+mod check;
 mod checkpoint;
 mod prep;
 // The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
@@ -12,14 +14,16 @@ mod prep;
 mod weights;
 
 use checkpoint::Checkpoint;
+use julia_rs::{
+    head::QType,
+    sequence::{DEFAULT_HEAD_LENGTH, Request, sequence},
+};
 use weights::{GpuWeights, HostWeights};
 
-const USAGE: &str = "usage: julia-cuda [checkpoint dir]
-  Without a checkpoint, only checks that the kernels load and run on GPU 0. With one, also
-  prepares and uploads the weights, and checks the upload.";
-
-/// Hidden size of the model.
-const D: usize = 384;
+const USAGE: &str = "usage: julia-cuda [checkpoint dir [--check]]
+  Without a checkpoint, only checks that the kernels load on GPU 0. With one, runs the kernels on
+  a sample request.
+  --check also verifies the weight upload and compares each kernel's output with julia-rs.";
 
 /// Generated with `embed_ptx!`.
 struct EmbeddedPtx {
@@ -105,75 +109,83 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Arc<CudaModule>> {
     Ok(module)
 }
 
-/// Runs `axpy` on N elements (not a multiple of the block size, so the last block has idle
-/// threads) and checks the result bit for bit against the CPU.
-fn axpy_selftest(stream: &Arc<CudaStream>, kernels: &Arc<CudaModule>) -> color_eyre::Result<()> {
-    const N: usize = 1000;
-    const BLOCK: u32 = 256;
-    // Fills y past N; the kernel is told y has N elements, so these must come back untouched.
-    const GUARD: f32 = -1234.5;
-    let grid = (N as u32).div_ceil(BLOCK);
-    let threads = (grid * BLOCK) as usize;
+/// Hidden size of the model.
+const D: usize = 384;
 
-    let a = 0.7f32;
-    let x: Vec<f32> = (0..N).map(|i| i as f32 * 0.37 - 100.0).collect();
-    let mut y: Vec<f32> = (0..threads).map(|i| 1.0 / (i + 1) as f32).collect();
-    y[N..].fill(GUARD);
+/// Threads per block for `embed`: a multiple of 32 (its `warp_sum` needs whole warps), one warp
+/// per token.
+const EMBED_BLOCK: u32 = 128;
 
-    let axpy = kernels.load_function("axpy")?;
-    let x_dev = stream.clone_htod(&x)?;
-    let mut y_dev = stream.clone_htod(&y)?;
-    // `arg` keeps references until the launch, so the lengths need names.
-    let (x_len, y_len) = (N as u64, N as u64);
+/// Runs the embedding kernel: the residual stream `x` (`[tokens.len(), D]`, f16) for `tokens`.
+pub fn embed(
+    stream: &Arc<CudaStream>,
+    kernels: &Arc<CudaModule>,
+    w: &GpuWeights,
+    tokens: &CudaSlice<u32>,
+    eps: f32,
+) -> color_eyre::Result<CudaSlice<half::f16>> {
+    let table = w.f16.slice(w.layout.tok_embeddings.range());
+    let table_len = table.len() as u64;
+    let gamma = w.f32.slice(w.layout.emb_norm.range());
+    let gamma_len = gamma.len() as u64;
+    let n = tokens.len();
+    ensure!(n > 0, "embed: no tokens");
+    let mut x = stream.alloc_zeros(n * D)?;
+    let n = n as u64;
+
     let cfg = LaunchConfig {
-        grid_dim: (grid, 1, 1),
-        block_dim: (BLOCK, 1, 1),
+        grid_dim: (n.div_ceil(EMBED_BLOCK as u64 / 32) as u32, 1, 1),
+        block_dim: (EMBED_BLOCK, 1, 1),
         shared_mem_bytes: 0,
     };
-    let mut launch = stream.launch_builder(&axpy);
-    // axpy(a: f32, x: &[f32], y: DisjointSlice<f32>) in PTX: a, x ptr, x len, y ptr, y len.
-    launch
-        .arg(&a)
-        .arg(&x_dev)
-        .arg(&x_len)
-        .arg(&mut y_dev)
-        .arg(&y_len);
-    // SAFETY: the arguments match that signature, and x and y hold at least N elements each.
-    unsafe { launch.launch(cfg) }?;
-    let out = stream.clone_dtoh(&y_dev)?; // waits for the kernel
 
-    // The GPU computes a * x + y as one fma (one rounding); Rust's `a * x + y` rounds twice.
-    for (i, &got) in out.iter().enumerate() {
-        let want = if i < N { a.mul_add(x[i], y[i]) } else { GUARD };
-        ensure!(
-            got.to_bits() == want.to_bits(),
-            "axpy: y[{i}] is {got}, expected {want}{}",
-            if i < N {
-                ""
-            } else {
-                " (past the end: the bounds check failed)"
-            }
-        );
+    let embed_kernel = kernels.load_function("embed")?;
+    let mut launch = stream.launch_builder(&embed_kernel);
+    // embed(tokens: &[u32], table: &[f16], gamma: &[f32], eps: f32, x: *mut f16)
+    launch
+        .arg(tokens)
+        .arg(&n)
+        .arg(&table)
+        .arg(&table_len)
+        .arg(&gamma)
+        .arg(&gamma_len)
+        .arg(&eps)
+        .arg(&mut x);
+    // SAFETY: the arguments match that signature, block size is a multiple of 32,
+    //   and x's dimensions match properly.
+    unsafe { launch.launch(cfg) }?;
+    Ok(x)
+}
+
+/// The request the kernels run on until requests come from stdin.
+fn sample_request() -> Request<'static> {
+    Request {
+        state: "Order #4417: the customer was charged twice for the same subscription renewal, \
+                once on the card on file and once on a gift card that should have been used up. \
+                They want the card charge refunded and the gift card restored."
+            .into(),
+        question: "Which team should handle this request?".into(),
+        qtype: QType::Choice,
+        options: ["Billing", "Shipping", "Account access", "Fraud"]
+            .map(Into::into)
+            .into(),
     }
-    let unfused = (0..N)
-        .filter(|&i| a * x[i] + y[i] != a.mul_add(x[i], y[i]))
-        .count();
-    eprintln!("axpy ok: {N} elements bit-exact ({unfused} would differ from an unfused a * x + y)");
-    Ok(())
 }
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let dir = match args.as_slice() {
-        [] => None,
-        [dir] if !dir.starts_with('-') => Some(PathBuf::from(dir)),
+    let (dir, check) = match args.as_slice() {
+        [] => (None, false),
+        [dir] if !dir.starts_with('-') => (Some(PathBuf::from(dir)), false),
+        [dir, flag] if !dir.starts_with('-') && flag == "--check" => {
+            (Some(PathBuf::from(dir)), true)
+        }
         _ => bail!(USAGE),
     };
 
     let ctx = CudaContext::new(0)?;
     let kernels = load_kernels(&ctx)?;
-    axpy_selftest(&ctx.default_stream(), &kernels)?;
     let Some(dir) = dir else {
         return Ok(());
     };
@@ -205,8 +217,27 @@ fn main() -> color_eyre::Result<()> {
     let gpu = GpuWeights::upload(&stream, &host)?;
     stream.synchronize()?;
     eprintln!("uploaded in {:.0} ms", ms(t));
-    gpu.verify(&stream, &host)?;
-    eprintln!("upload verified: both buffers bit-exact");
+    if check {
+        gpu.verify(&stream, &host)?;
+        eprintln!("upload verified: both buffers bit-exact");
+    }
+
+    let seq = sequence(
+        &ck.tokenizer,
+        &sample_request(),
+        c.max_positions,
+        DEFAULT_HEAD_LENGTH,
+    )?;
+    let ids = stream.clone_htod(&seq.ids)?;
+    let t = Instant::now();
+    let x = embed(&stream, &kernels, &gpu, &ids, c.norm_eps)?;
+    stream.synchronize()?;
+    eprintln!("embed: {} tokens in {:.3} ms", seq.ids.len(), ms(t));
+
+    if check {
+        let model = check::reference_model(&dir)?;
+        check::embed(&model, &host, &seq.ids, c.norm_eps, &stream.clone_dtoh(&x)?)?;
+    }
     Ok(())
 }
 

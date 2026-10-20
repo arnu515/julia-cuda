@@ -39,16 +39,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use julia_rs::{
-        Model, ModelPaths,
+        Model,
         attn::{Rope, Scratch, attention},
-        head::QType,
-        load_model,
-        matmul::{Precision, linear, linear_add},
+        matmul::{linear, linear_add},
         mlp::geglu,
-        sequence::{Request, sequence},
+        sequence::sequence,
     };
 
     use super::*;
+    use crate::check::rel_err;
 
     /// The checkpoint, from `JULIA_MODEL` or ./model; `None` (test skipped) if it isn't there.
     fn model() -> Option<Model> {
@@ -62,15 +61,7 @@ mod tests {
             );
             return None;
         }
-        let path = |p: &str| dir.join(p);
-        let paths = ModelPaths {
-            safetensors_path: &path("model.safetensors"),
-            encoder_config_json_path: &path("encoder/config.json"),
-            julia_config_json_path: &path("julia_config.json"),
-            tokenizer_json_path: &path("tokenizer/tokenizer.json"),
-            tokenizer_config_json_path: &path("tokenizer/tokenizer_config.json"),
-        };
-        Some(load_model(paths, Precision::F32).unwrap())
+        Some(crate::check::reference_model(&dir).unwrap())
     }
 
     /// The residual stream entering each layer's attention and MLP LayerNorm, from julia-rs's
@@ -181,16 +172,6 @@ mod tests {
         f16_round(&out)
     }
 
-    /// ‖a - b‖ / ‖b‖ over the whole tensor.
-    fn rel_err(a: &[f32], b: &[f32]) -> f64 {
-        let (mut num, mut den) = (0f64, 0f64);
-        for (&a, &b) in a.iter().zip(b) {
-            num += (f64::from(a) - f64::from(b)).powi(2);
-            den += f64::from(b).powi(2);
-        }
-        (num / den).sqrt()
-    }
-
     /// The fold against julia-rs's `LN(x) · Wᵀ` (in f64), on real residual streams at several
     /// depths, for both folded GEMMs (qkv after the attention LayerNorm, wi after the MLP one).
     /// "f16" is the same computation unfolded with f16 inputs and outputs: the error fp16 costs
@@ -198,17 +179,7 @@ mod tests {
     #[test]
     fn fold_matches_layernorm_then_linear() {
         let Some(model) = model() else { return };
-        let req = Request {
-            state: "Order #4417: the customer was charged twice for the same subscription \
-                    renewal, once on the card on file and once on a gift card that should have \
-                    been used up. They want the card charge refunded and the gift card restored."
-                .into(),
-            question: "Which team should handle this request?".into(),
-            qtype: QType::Choice,
-            options: ["Billing", "Shipping", "Account access", "Fraud"]
-                .map(Into::into)
-                .into(),
-        };
+        let req = crate::sample_request();
         let seq = sequence(&model.tokenizer, &req, 1024, 512).unwrap();
         let (d, eps, data) = (model.config.hidden, model.config.norm_eps, model.data());
         let residuals = residuals(&model, &seq.ids);
