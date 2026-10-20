@@ -191,7 +191,12 @@ pub fn compute<const MI: usize>(acc: &mut [[[f32; 4]; 4]; MI], a_s: *const u16, 
             }));
             #[unroll]
             for j in 0..4usize {
-                mma(&mut acc[i][j], &a, b[j >> 1][(j & 1) * 2], b[j >> 1][(j & 1) * 2 + 1]);
+                mma(
+                    &mut acc[i][j],
+                    &a,
+                    b[j >> 1][(j & 1) * 2],
+                    b[j >> 1][(j & 1) * 2 + 1],
+                );
             }
         }
     }
@@ -284,7 +289,9 @@ pub fn mainloop<const MI: usize, const WR: u32>(
         }
         let cur = ((kt - kt0) & 1) as usize;
         // SAFETY: stage `cur` of the two-stage buffers.
-        compute::<MI>(acc, unsafe { a_s.add(cur * ATILE) }, unsafe { w_s.add(cur * TILE) });
+        compute::<MI>(acc, unsafe { a_s.add(cur * ATILE) }, unsafe {
+            w_s.add(cur * TILE)
+        });
         if kt + 1 < kt1 {
             let nxt = 1 - cur;
             // The other stage: nobody reads it this step (the barrier below ends the step).

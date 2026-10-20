@@ -17,8 +17,6 @@ mod gemm;
 mod prep;
 mod serve;
 mod timing;
-// The layout is read by the kernel launches (from the embedding kernel on); until then only by the upload.
-#[allow(dead_code)]
 mod weights;
 
 use checkpoint::Checkpoint;

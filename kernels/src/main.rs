@@ -102,7 +102,14 @@ mod kernels {
     /// question type's embedding), and each output row's Σ and Σ² (of the stored f16 values) into
     /// `stats` (written, not added). One warp per row, as `embed`.
     #[kernel]
-    pub fn norm_add(x: &[f16], gamma: &[f32], add: &[f32], eps: f32, out: *mut f16, stats: *mut f32) {
+    pub fn norm_add(
+        x: &[f16],
+        gamma: &[f32],
+        add: &[f32],
+        eps: f32,
+        out: *mut f16,
+        stats: *mut f32,
+    ) {
         let tid = thread::index_1d().get();
         let (row, lane) = (tid / 32, tid % 32);
         if row >= x.len() / D {
@@ -125,7 +132,8 @@ mod kernels {
         // and the early return is the same for a warp's lanes.
         let mean = unsafe { warp_sum(v.iter().sum::<f32>()) } / D as f32;
         // SAFETY: as for the mean.
-        let var = unsafe { warp_sum(v.iter().map(|&a| (a - mean) * (a - mean)).sum::<f32>()) } / D as f32;
+        let var =
+            unsafe { warp_sum(v.iter().map(|&a| (a - mean) * (a - mean)).sum::<f32>()) } / D as f32;
         let rstd = 1f32 / (var + eps).sqrt();
         let (mut s, mut s2) = (0f32, 0f32);
         #[unroll]
@@ -296,7 +304,10 @@ mod kernels {
         let mut qf = [[0u32; 4]; 4];
         #[unroll]
         for ks_ in 0..4u32 {
-            qf[ks_ as usize] = gemm::ldsm_x4(attn::at(qs, attn::swz64(warp * 16 + (lane & 15), ks_ * 2 + (lane >> 4))));
+            qf[ks_ as usize] = gemm::ldsm_x4(attn::at(
+                qs,
+                attn::swz64(warp * 16 + (lane & 15), ks_ * 2 + (lane >> 4)),
+            ));
         }
 
         // Key blocks: all, or those the window of any of this block's queries reaches.
@@ -348,9 +359,14 @@ mod kernels {
                     for e in 0..2usize {
                         let key = k0 + 8 * jt + 2 * t + e as u32;
                         let q = qrow[h];
-                        let near = window == 0 || (if q > key { q - key } else { key - q }) <= window;
+                        let near =
+                            window == 0 || (if q > key { q - key } else { key - q }) <= window;
                         let v = &mut s[jt as usize][2 * h + e];
-                        *v = if key < n && near { *v * scale } else { f32::NEG_INFINITY };
+                        *v = if key < n && near {
+                            *v * scale
+                        } else {
+                            f32::NEG_INFINITY
+                        };
                         m = if *v > m { *v } else { m };
                     }
                 }
@@ -363,7 +379,11 @@ mod kernels {
                 }
                 let m_new = if m > mx[h] { m } else { mx[h] };
                 // A row with no valid key yet keeps -inf; exp2(-inf - 0) = 0 then.
-                let base = if m_new == f32::NEG_INFINITY { 0.0 } else { m_new };
+                let base = if m_new == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    m_new
+                };
                 let alpha = attn_exp2(mx[h] - base);
                 mx[h] = m_new;
                 let mut rs = 0f32;
@@ -394,7 +414,10 @@ mod kernels {
                 ];
                 #[unroll]
                 for dp in 0..4u32 {
-                    let v = attn::ldsm_x4_trans(attn::at(vs, attn::swz64(16 * kk as u32 + (lane & 15), 2 * dp + (lane >> 4))));
+                    let v = attn::ldsm_x4_trans(attn::at(
+                        vs,
+                        attn::swz64(16 * kk as u32 + (lane & 15), 2 * dp + (lane >> 4)),
+                    ));
                     gemm::mma(&mut acc[2 * dp as usize], &a, v[0], v[1]);
                     gemm::mma(&mut acc[2 * dp as usize + 1], &a, v[2], v[3]);
                 }
@@ -416,10 +439,15 @@ mod kernels {
                 #[unroll]
                 for jt in 0..8u32 {
                     let col = head * attn::HD as u32 + 8 * jt + 2 * t;
-                    let out = gemm::pack(acc[jt as usize][2 * h] * inv, acc[jt as usize][2 * h + 1] * inv);
+                    let out = gemm::pack(
+                        acc[jt as usize][2 * h] * inv,
+                        acc[jt as usize][2 * h + 1] * inv,
+                    );
                     // SAFETY: qrow < n and col + 1 < D: inside o ([n, D]); 4-byte aligned (even
                     // col); each (row, column pair) has one owner.
-                    unsafe { *(o.add(qrow[h] as usize * attn::D + col as usize) as *mut u32) = out };
+                    unsafe {
+                        *(o.add(qrow[h] as usize * attn::D + col as usize) as *mut u32) = out
+                    };
                 }
             }
         }
@@ -503,7 +531,8 @@ mod kernels {
                 while zi < zero_len {
                     // SAFETY: zi < zero_len, the host's length for `zero`.
                     unsafe { *zero.add(zi as usize) = 0.0 };
-                    zi += thread::gridDim_x() * thread::gridDim_y() * thread::gridDim_z() * 64 * $wr;
+                    zi +=
+                        thread::gridDim_x() * thread::gridDim_y() * thread::gridDim_z() * 64 * $wr;
                 }
                 let mut acc = [[[0f32; 4]; 4]; $mi];
                 gemm::mainloop::<$mi, $wr>(&mut acc, a, w, m, k);
@@ -514,7 +543,8 @@ mod kernels {
                 // The epilogue's loops live here: #[unroll] works only in kernels and #[device]
                 // functions, and LLVM won't inline a #[device] function this large.
                 let (lane, warp) = (tid & 31, tid >> 5);
-                let r0 = thread::blockIdx_y() * 16 * $mi * $wr + (warp >> 1) * 16 * $mi + (lane >> 2);
+                let r0 =
+                    thread::blockIdx_y() * 16 * $mi * $wr + (warp >> 1) * 16 * $mi + (lane >> 2);
                 // The (packed) W row, i.e. output column, of fragment j = 0.
                 let cw = thread::blockIdx_x() * 64 + (warp & 1) * 32 + (lane & 3) * 2;
                 #[unroll]
@@ -586,8 +616,12 @@ mod kernels {
                             for q in 0..2usize {
                                 if ok {
                                     let (x, g) = (v[2 * q], v[2 * q + 1]);
-                                    let idx = r as usize * (n / 2) as usize + (c0 + q as u32 * 8) as usize;
-                                    let out = gemm::pack(gemm::gelu(x[0]) * g[0], gemm::gelu(x[1]) * g[1]);
+                                    let idx = r as usize * (n / 2) as usize
+                                        + (c0 + q as u32 * 8) as usize;
+                                    let out = gemm::pack(
+                                        gemm::gelu(x[0]) * g[0],
+                                        gemm::gelu(x[1]) * g[1],
+                                    );
                                     // SAFETY: r < m and the column < n/2; 4-byte aligned (even
                                     // column); each (r, column pair) has one owner.
                                     unsafe { *(c.add(idx) as *mut u32) = out };
@@ -598,12 +632,14 @@ mod kernels {
                             #[unroll]
                             for j in 0..4usize {
                                 if ok {
-                                    let idx = r as usize * n as usize + (cw + j as u32 * 8) as usize;
+                                    let idx =
+                                        r as usize * n as usize + (cw + j as u32 * 8) as usize;
                                     let (mut lo, mut hi) = (v[j][0], v[j][1]);
                                     if (EPI & EPI_RES) != 0 {
                                         // SAFETY: res is [m, n] like c; this thread reads only
                                         // the pair it writes next, so aliasing c is fine.
-                                        let (x, y) = gemm::unpack(unsafe { *(res.add(idx) as *const u32) });
+                                        let (x, y) =
+                                            gemm::unpack(unsafe { *(res.add(idx) as *const u32) });
                                         lo += x;
                                         hi += y;
                                     }
@@ -672,7 +708,12 @@ mod kernels {
     gemm!(gemm_128w8_lnbias, 2, 4, EPI_LN | EPI_BIAS);
     gemm!(gemm_128w8_lnbiasrelu, 2, 4, EPI_LN | EPI_BIAS | EPI_RELU);
     gemm!(gemm_128w8_lnbiasgelu, 2, 4, EPI_LN | EPI_BIAS | EPI_GELU);
-    gemm!(gemm_128w8_biasresstats, 2, 4, EPI_BIAS | EPI_RES | EPI_STATS);
+    gemm!(
+        gemm_128w8_biasresstats,
+        2,
+        4,
+        EPI_BIAS | EPI_RES | EPI_STATS
+    );
 }
 
 // needed for binary crate; never ran.
