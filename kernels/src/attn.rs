@@ -69,3 +69,129 @@ pub fn at(p: *const u16, off: u32) -> u32 {
     // SAFETY: callers pass offsets inside the tile.
     saddr(unsafe { p.add(off as usize) })
 }
+
+/// f32 values per thread in a key-range partial: the 32 unnormalized output values, then the
+/// running max and this lane's part of the running sum for its two rows.
+pub const PART: usize = 36;
+
+/// The merge of a (64 queries, head) tile's key-range partials (`attention_task` with several
+/// chunks). Every chunk's task writes its `acc`, `mx`, `sum` to its slot of `ws`; the last of the
+/// `chunks` tasks of tile `tile` to arrive (counted in `counters`, which it resets) reads every
+/// slot back in chunk order and rescales them to the common max:
+/// acc = Σ_z acc_z · 2^(mx_z − mx), sum likewise. Returns whether this task holds the merged
+/// values (and stores the output).
+///
+/// # Safety
+/// `ws` must hold PART·128 floats per (tile, chunk) and `counters` one zeroed u32 per tile;
+/// `last` is one u32 of shared memory; every thread of the block calls it.
+#[device]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn split_merge(
+    acc: &mut [[f32; 4]; 8],
+    sum: &mut [f32; 2],
+    mx: &mut [f32; 2],
+    ws: *mut f32,
+    counters: *mut u32,
+    tile: u32,
+    chunk: u32,
+    chunks: u32,
+    last: *mut u32,
+) -> bool {
+    let tid = thread::threadIdx_x() as usize;
+    // Slot of chunk z: [PART values][128 threads], so the stores coalesce.
+    let slot = |z: u32| unsafe { ws.add((tile * chunks + z) as usize * PART * 128 + tid) };
+    let mine = slot(chunk);
+    #[unroll]
+    for jt in 0..8usize {
+        #[unroll]
+        for e in 0..4usize {
+            // SAFETY: inside this (tile, chunk)'s slot (the caller's size); only this thread
+            // writes its column of it.
+            unsafe { *mine.add((jt * 4 + e) * 128) = acc[jt][e] };
+        }
+    }
+    #[unroll]
+    for h in 0..2usize {
+        // SAFETY: as above.
+        unsafe {
+            *mine.add((32 + h) * 128) = mx[h];
+            *mine.add((34 + h) * 128) = sum[h];
+        }
+    }
+    // SAFETY: the partial is written before the arrival is counted (fence), and the counter
+    // is read by thread 0 only; as gemm::split_reduce.
+    unsafe { ptx_asm!("membar.gl;", clobber("memory")) };
+    thread::sync_threads();
+    if tid == 0 {
+        let old: u32;
+        // SAFETY: counters has one u32 per tile (the caller's size); last is shared.
+        unsafe {
+            ptx_asm!("atom.global.add.u32 %0, [%1], 1;", out("=r") old, in("l") counters.add(tile as usize), clobber("memory"));
+            let is_last = old == chunks - 1;
+            if is_last {
+                *counters.add(tile as usize) = 0;
+            }
+            *last = is_last as u32;
+        }
+    }
+    thread::sync_threads();
+    // SAFETY: last is shared, written by thread 0 before the barrier above.
+    if unsafe { *last } == 0 {
+        return false;
+    }
+    // SAFETY: as above: the other chunks' partials are complete before their arrivals.
+    unsafe { ptx_asm!("membar.gl;", clobber("memory")) };
+    // .cg: from L2, not a stale L1 line (other blocks wrote these).
+    let ld = |p: *const f32| {
+        let v: f32;
+        // SAFETY: callers pass addresses inside a slot.
+        unsafe { ptx_asm!("ld.global.cg.f32 %0, [%1];", out("=f") v, in("l") p) };
+        v
+    };
+    let mut m = [f32::NEG_INFINITY; 2];
+    let mut z = 0;
+    while z < chunks {
+        let p = slot(z);
+        #[unroll]
+        for h in 0..2usize {
+            // SAFETY: inside slot z.
+            let v = ld(unsafe { p.add((32 + h) * 128) });
+            m[h] = if v > m[h] { v } else { m[h] };
+        }
+        z += 1;
+    }
+    *acc = [[0f32; 4]; 8];
+    *sum = [0f32; 2];
+    let mut z = 0;
+    while z < chunks {
+        let p = slot(z);
+        #[unroll]
+        for h in 0..2usize {
+            // A row no chunk has a key for (only rows past n) keeps -inf and zeros.
+            let base = if m[h] == f32::NEG_INFINITY { 0.0 } else { m[h] };
+            // SAFETY: inside slot z.
+            let f = ex2(ld(unsafe { p.add((32 + h) * 128) }) - base);
+            // SAFETY: inside slot z.
+            sum[h] += ld(unsafe { p.add((34 + h) * 128) }) * f;
+            #[unroll]
+            for jt in 0..8usize {
+                #[unroll]
+                for e in 0..2usize {
+                    // SAFETY: inside slot z.
+                    acc[jt][2 * h + e] += ld(unsafe { p.add((jt * 4 + 2 * h + e) * 128) }) * f;
+                }
+            }
+        }
+        z += 1;
+    }
+    *mx = m;
+    true
+}
+
+#[inline(always)]
+fn ex2(x: f32) -> f32 {
+    let r: f32;
+    // SAFETY: register-only.
+    unsafe { ptx_asm!("ex2.approx.ftz.f32 %0, %1;", out("=f") r, in("f") x) };
+    r
+}

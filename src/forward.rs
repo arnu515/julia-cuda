@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use color_eyre::eyre::ensure;
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use half::f16;
 
 use crate::{
@@ -33,12 +33,24 @@ pub struct GpuEncoder<'a> {
     pub m: CudaSlice<f16>,
     pub stats_attn: CudaSlice<f32>,
     pub stats_mlp: CudaSlice<f32>,
-    /// Run each layer as one persistent launch (`layer_32` / `layer_64`)
+    /// Run each layer as one persistent launch (`layer`)
     /// instead of five.
     pub fused: bool,
     /// The layer kernel's grid-barrier counter, and the arrivals counted so far.
     pub bar: CudaSlice<u32>,
     pub bar_count: u32,
+    /// With `fused`: the layer kernel as five plain launches per layer, one phase each (same
+    /// grid and tasks, launch boundaries in place of the grid barriers), for measurements.
+    pub split_phases: bool,
+    /// With `fused`: at most this many blocks (for measurements).
+    pub grid_cap: Option<u32>,
+    /// With `fused`: overrides `default_plan` (for sweeps).
+    pub plan: Option<LayerPlan>,
+    /// With `fused`: the original grid barrier, with two fences on each side (for comparison).
+    pub two_fence_barrier: bool,
+    /// With `fused`: the layer kernel's timestamps (`prof`), `PROF_WORDS` u64 per block of the
+    /// largest grid, per layer; None: no profiling.
+    pub prof: Option<CudaSlice<u64>>,
 }
 
 impl<'a> GpuEncoder<'a> {
@@ -72,6 +84,11 @@ impl<'a> GpuEncoder<'a> {
             fused: false,
             bar: stream.alloc_zeros(1)?,
             bar_count: 0,
+            split_phases: false,
+            grid_cap: None,
+            plan: None,
+            two_fence_barrier: false,
+            prof: None,
             x,
         })
     }
@@ -147,44 +164,95 @@ impl<'a> GpuEncoder<'a> {
         self.launch_wo_mlp(l)
     }
 
-    /// The persistent layer kernel for this token count, its tile height, and the grid: as many
-    /// blocks as fit on the GPU at once, but no more than the largest phase has tasks.
-    pub fn layer_kernel(&self) -> color_eyre::Result<(&'a CudaFunction, usize, u32, [u32; 2])> {
+    /// The layer kernel's plan for this token count and GPU: for each GEMM, the tile height and
+    /// split-K with the lowest `phase_cost`; for global attention, key ranges while the tasks
+    /// still fit on the GPU at once, at least two key blocks each (on the 2080 Ti at 363 tokens,
+    /// 3 ranges: 15.4 instead of 20.8 µs per global layer; at 72-607 tokens:
+    /// the best count or within 0.4 µs per layer of it). Sliding-window layers keep whole key
+    /// ranges: a tile reaches only 3 key blocks, and splitting them was never faster.
+    pub fn default_plan(&self) -> LayerPlan {
         let n = self.rows();
         let inter = self.m.len() / n;
-        // The tile height choose() would pick, of the two the layer kernel has.
-        let ((f, per_sm), bm) = match gemm::choose(n, 3 * D, D, self.sms).shape {
-            gemm::Shape::S32 => (&self.kernels.layer_32, 32),
-            _ => (&self.kernels.layer_64, 64),
+        let (sms, per_sm) = (self.sms, self.kernels.layer.1);
+        let mut plan = LayerPlan {
+            bm: [32; 4],
+            splits: [1; 4],
+            kv: [1; 2],
         };
-        let splits = [
-            gemm::splits(n, D, D, bm, self.sms),
-            gemm::splits(n, D, inter, bm, self.sms),
-        ];
-        let rows = n.div_ceil(bm);
-        let tasks = [
-            (3 * D / 64) * rows,
-            n.div_ceil(64) * (D / 64),
-            (D / 64) * rows * splits[0] as usize,
-            (2 * inter / 64) * rows,
-            (D / 64) * rows * splits[1] as usize,
-        ];
-        let grid = (self.sms * per_sm).min(tasks.into_iter().max().unwrap()) as u32;
-        Ok((f, bm, grid, splits))
+        let shapes = [(3 * D, D), (D, D), (2 * inter, D), (D, inter)];
+        for (g, &(cols, k)) in shapes.iter().enumerate() {
+            (plan.bm[g], plan.splits[g]) = gemm_plan(n, cols, k, sms, per_sm);
+        }
+        let (blocks, tiles) = (n.div_ceil(64), n.div_ceil(64) * (D / 64));
+        plan.kv[0] = (sms * per_sm / tiles).min(blocks.div_ceil(2)).clamp(1, 6) as u32;
+        plan
+    }
+
+    pub fn plan(&self) -> LayerPlan {
+        self.plan.unwrap_or_else(|| self.default_plan())
+    }
+
+    /// The tasks of each of the layer kernel's phases under `plan`, in a global (or
+    /// sliding-window) layer.
+    pub fn layer_tasks(&self, plan: LayerPlan, global: bool) -> [usize; 5] {
+        let n = self.rows();
+        let inter = self.m.len() / n;
+        let gemm =
+            |g: usize, cols: usize| (cols / 64) * n.div_ceil(plan.bm[g]) * plan.splits[g] as usize;
+        let kv = plan.kv[if global { 0 } else { 1 }] as usize;
+        [
+            gemm(0, 3 * D),
+            n.div_ceil(64) * (D / 64) * kv,
+            gemm(1, D),
+            gemm(2, 2 * inter),
+            gemm(3, D),
+        ]
+    }
+
+    /// The layer kernel's grid for layer `l`: as many blocks as fit on the GPU at once, but no
+    /// more than the largest phase has tasks (and `grid_cap`).
+    pub fn layer_grid(&self, l: usize) -> u32 {
+        let tasks = self.layer_tasks(self.plan(), self.w.layout.layers[l].global);
+        let grid = self.max_grid().min(tasks.into_iter().max().unwrap()) as u32;
+        self.grid_cap.map_or(grid, |c| grid.min(c))
+    }
+
+    /// The most blocks the layer kernel can have.
+    pub fn max_grid(&self) -> usize {
+        self.sms * self.kernels.layer.1
     }
 
     /// Queues layer `l` as one cooperative launch of the persistent layer kernel.
     pub fn launch_layer_fused(&mut self, l: usize) -> color_eyre::Result<()> {
         let n = self.rows();
         let inter = self.m.len() / n;
-        let (f, bm, grid, splits) = self.layer_kernel()?;
+        let (f, plan, grid) = (&self.kernels.layer.0, self.plan(), self.layer_grid(l));
         let sc = self.scratch;
-        let tiles = (D / 64) * n.div_ceil(bm);
-        ensure!(
-            tiles * 4 * bm * 64 <= sc.ws.len() && tiles <= sc.counters.len(),
-            "layer: the split-K scratch is too small for {n} tokens"
-        );
         let lay = &self.w.layout.layers[l];
+        let kv = plan.kv[if lay.global { 0 } else { 1 }];
+        ensure!(
+            plan.bm.iter().all(|&b| b == 32 || b == 64)
+                && plan.splits.iter().all(|&z| (1..=4).contains(&z))
+                && (1..=6).contains(&kv),
+            "layer: no such plan: {plan}"
+        );
+        // Split-K partials (BM × 64 floats per tile and split) and key-range partials
+        // (attn::PART floats per thread per tile and chunk), one counter per tile.
+        let cols = [3 * D, D, 2 * inter, D];
+        for g in 0..4 {
+            let tiles = (cols[g] / 64) * n.div_ceil(plan.bm[g]);
+            ensure!(
+                tiles * plan.splits[g] as usize * plan.bm[g] * 64 <= sc.ws.len()
+                    && tiles <= sc.counters.len(),
+                "layer: the split-K scratch is too small for {n} tokens ({plan})"
+            );
+        }
+        let attn_tiles = n.div_ceil(64) * (D / 64);
+        ensure!(
+            attn_tiles * kv as usize * crate::attn::PART * 128 <= sc.ws.len()
+                && attn_tiles <= sc.counters.len(),
+            "layer: the key-range scratch is too small for {n} tokens ({plan})"
+        );
         let s = self.stream;
         let rope = match lay.global {
             true => self.w.layout.rope_global,
@@ -216,38 +284,73 @@ impl<'a> GpuEncoder<'a> {
             wptr(lay.wo_mlp.range()),
         ];
         let window = if lay.global { 0 } else { self.window as u32 };
-        let (n32, inter32, base) = (n as u32, inter as u32, self.bar_count);
-        let mut launch = s.launch_builder(f);
-        // layer_*(x, qkv, o, mbuf, stats_attn, stats_mlp, ws, counters, bar, bar_base, wqkv,
-        // qkv_colsum, rope, wo, wi, wi_colsum, wo_mlp, m, inter, eps, window, splits_wo,
-        // splits_wo_mlp)
-        for a in &args[..9] {
-            launch.arg(a);
-        }
-        launch.arg(&base);
-        for a in &args[9..16] {
-            launch.arg(a);
-        }
-        launch
-            .arg(&n32)
-            .arg(&inter32)
-            .arg(&self.eps)
-            .arg(&window)
-            .arg(&splits[0])
-            .arg(&splits[1]);
+        let (n32, inter32) = (n as u32, inter as u32);
+        let prof = match &self.prof {
+            Some(p) => {
+                let words = crate::profile::PROF_WORDS * self.max_grid();
+                ensure!(
+                    p.len() >= (l + 1) * words,
+                    "layer: the profile buffer is too small"
+                );
+                gemm::ptr(s, p) + (l * words * 8) as u64
+            }
+            None => 0,
+        };
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the buffers are the encoder's ([n, D] x and o, [n, 3D] qkv, [n, inter] m, 2n
-        // statistics each) and the weights' spans for layer l, all 16-byte aligned; the split-K
-        // scratch and the RoPE table are big enough (checked); qkv_colsum is null only in
-        // layer 0, which has no LayerNorm. A cooperative launch with at most the resident
-        // number of blocks, so the grid barriers can't deadlock; 128 threads, as the kernel
-        // assumes.
-        unsafe { launch.launch_cooperative(cfg) }?;
-        self.bar_count = self.bar_count.wrapping_add(4 * grid);
+        let pack = |v: [u32; 4]| v.iter().rev().fold(0, |a, &x| (a << 4) | x);
+        let mis = pack(plan.bm.map(|b| (b / 32) as u32));
+        let splits = pack(plan.splits);
+        let old_barrier = if self.two_fence_barrier { 1 << 8 } else { 0 };
+        // All five phases with grid barriers, or each on its own (no barriers).
+        let launches: &[u32] = match self.split_phases {
+            false => &[0x1f],
+            true => &[1, 2, 4, 8, 16],
+        };
+        for &phases in launches {
+            let phases = phases | old_barrier;
+            let base = self.bar_count;
+            let mut launch = s.launch_builder(f);
+            // layer(x, qkv, o, mbuf, stats_attn, stats_mlp, ws, counters, bar, bar_base, wqkv,
+            // qkv_colsum, rope, wo, wi, wi_colsum, wo_mlp, m, inter, eps, window, mis, splits,
+            // kv_chunks, phases, prof)
+            for a in &args[..9] {
+                launch.arg(a);
+            }
+            launch.arg(&base);
+            for a in &args[9..] {
+                launch.arg(a);
+            }
+            launch
+                .arg(&n32)
+                .arg(&inter32)
+                .arg(&self.eps)
+                .arg(&window)
+                .arg(&mis)
+                .arg(&splits)
+                .arg(&kv)
+                .arg(&phases)
+                .arg(&prof);
+            // SAFETY: the buffers are the encoder's ([n, D] x and o, [n, 3D] qkv, [n, inter] m,
+            // 2n statistics each) and the weights' spans for layer l, all 16-byte aligned; the
+            // split-K / key-range scratch and the RoPE table are big enough for the plan (checked;
+            // tile heights 32 or 64, 1-4 splits, 1-6 key ranges); qkv_colsum is null
+            // only in layer 0, which has no LayerNorm; prof is null or has PROF_WORDS per block
+            // for this layer (checked, grid <= max_grid). With barriers (more than one phase), a
+            // cooperative launch with at most the resident number of blocks, so they can't
+            // deadlock; one phase has none. 128 threads, as the kernel assumes.
+            unsafe {
+                match (phases & 0x1f).count_ones() {
+                    1 => launch.launch(cfg),
+                    _ => launch.launch_cooperative(cfg),
+                }
+            }?;
+            let barriers = (phases & 0x1f).count_ones() - 1;
+            self.bar_count = self.bar_count.wrapping_add(barriers * grid);
+        }
         Ok(())
     }
 
@@ -618,5 +721,94 @@ impl<'a> GpuHead<'a> {
             self.launch_layer(l)?;
         }
         self.launch_score()
+    }
+}
+
+/// How the layer kernel cuts a layer into tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerPlan {
+    /// The tile height (32 or 64 rows) of qkv, wo, wi and wo_mlp.
+    pub bm: [usize; 4],
+    /// Their split-K (1-4).
+    pub splits: [u32; 4],
+    /// Key ranges per attention tile (64 queries, head; 1-6), in global and in sliding-window
+    /// layers.
+    pub kv: [u32; 2],
+}
+
+impl std::fmt::Display for LayerPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = ["qkv", "wo", "wi", "wo_mlp"];
+        for (g, name) in names.iter().enumerate() {
+            write!(f, "{name} {}/{} ", self.bm[g], self.splits[g])?;
+        }
+        write!(f, "kv {}/{}", self.kv[0], self.kv[1])
+    }
+}
+
+/// The tile height (32 or 64) and split-K (1-4, at least 3 K steps per split as
+/// `gemm::splits`) with the lowest `phase_cost` for a layer-kernel GEMM phase.
+pub fn gemm_plan(n: usize, cols: usize, k: usize, sms: usize, per_sm: usize) -> (usize, u32) {
+    let cost = |&(bm, z): &(usize, u32)| phase_cost(n, cols, k, bm, z, sms, per_sm);
+    [32, 64]
+        .into_iter()
+        .flat_map(|bm| (1..=4).map(move |z| (bm, z)))
+        .filter(|&(_, z)| k / 32 / z as usize >= 3)
+        .min_by(|a, b| cost(a).total_cmp(&cost(b)))
+        .unwrap()
+}
+
+/// The estimated time (µs) of a layer-kernel GEMM phase, `n` rows × `cols` × `k`, in tiles of
+/// `bm` rows with `z` K splits, on `sms` SMs with `per_sm` blocks each: the slowest SM's.
+///
+/// Fitted to plan sweeps on the 2080 Ti (each GEMM's 8 tile heights × splits, at 9
+/// lengths from 72 to 607 tokens): it picks the measured best (or a tie) in 30 of the 36
+/// cases, and is at most 1.6 µs per layer slower in the others (2.7 µs per layer summed over
+/// the 36); also an earlier sweep's best in 7 of 8. A task (one tile, or one split of it) takes 5 µs
+/// (10 with 64-row tiles: twice the epilogue and the first loads) plus 0.35 µs per 32-deep K
+/// step, the steps waiting mostly on L2 latency; c tasks at once on one SM take
+/// 1 + 0.2·(c − 1) times one task (the second block per SM mostly fills the first one's
+/// waits); tiles split z ways add 0.4 µs per split and 32 rows for the block that sums the
+/// partials. Tasks go to SMs round-robin, so the busiest SM has ⌈tasks / SMs⌉.
+pub fn phase_cost(
+    n: usize,
+    cols: usize,
+    k: usize,
+    bm: usize,
+    z: u32,
+    sms: usize,
+    per_sm: usize,
+) -> f64 {
+    let tasks = (cols / 64) * n.div_ceil(bm) * z as usize;
+    let steps = (k / 32) as f64 / z as f64;
+    let task = if bm == 32 { 5.0 } else { 10.0 } + 0.35 * steps;
+    let at_once = |c: usize| 1.0 + 0.2 * (c as f64 - 1.0);
+    let on_sm = tasks.div_ceil(sms);
+    let (rounds, rest) = (on_sm / per_sm, on_sm % per_sm);
+    let mut t = rounds as f64 * at_once(per_sm) * task;
+    if rest > 0 {
+        t += at_once(rest) * task;
+    }
+    if z > 1 {
+        t += 0.4 * z as f64 * (bm / 32) as f64;
+    }
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `gemm_plan` on the 2080 Ti (68 SMs, 2 blocks each) against the plan sweeps: the
+    /// measured best of each GEMM at 72, 363 and 512 tokens, except wo_mlp at 72 (measured 32/4,
+    /// 0.3 µs per layer faster than this 32/3).
+    #[test]
+    fn plan_matches_the_sweeps() {
+        let (inter, sms, per_sm) = (1152, 68, 2);
+        let shapes = [(3 * D, D), (D, D), (2 * inter, D), (D, inter)];
+        let picks = |n: usize| shapes.map(|(cols, k)| gemm_plan(n, cols, k, sms, per_sm));
+        assert_eq!(picks(72), [(32, 1), (32, 3), (32, 1), (32, 3)]);
+        assert_eq!(picks(363), [(64, 1), (32, 1), (64, 1), (64, 3)]);
+        assert_eq!(picks(512), [(64, 1), (32, 1), (64, 1), (32, 1)]);
     }
 }

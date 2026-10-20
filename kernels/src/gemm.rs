@@ -460,3 +460,30 @@ pub unsafe fn grid_sync(bar: *mut u32, target: u32) {
     }
     thread::sync_threads();
 }
+
+/// `grid_sync` with one fence on each side instead of two: the arrival is a release
+/// reduction (it orders the block's earlier writes, made visible to thread 0 by the block
+/// barrier, before it), the spin reads are relaxed, and one acquire fence after the last of
+/// them orders everything after the barrier behind the other blocks' arrivals.
+///
+/// # Safety
+/// As `grid_sync`.
+#[inline(always)]
+pub unsafe fn grid_sync_lean(bar: *mut u32, target: u32) {
+    thread::sync_threads();
+    if thread::threadIdx_x() == 0 {
+        // SAFETY: the caller guarantees `bar`.
+        unsafe {
+            ptx_asm!("red.release.gpu.global.add.u32 [%0], 1;", in("l") bar, clobber("memory"));
+            let mut seen: u32;
+            loop {
+                ptx_asm!("ld.relaxed.gpu.global.u32 %0, [%1];", out("=r") seen, in("l") bar, clobber("memory"));
+                if seen.wrapping_sub(target) as i32 >= 0 {
+                    break;
+                }
+            }
+            ptx_asm!("fence.acq_rel.gpu;", clobber("memory"));
+        }
+    }
+    thread::sync_threads();
+}

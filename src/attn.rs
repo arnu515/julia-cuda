@@ -11,6 +11,10 @@ use crate::D;
 /// Heads of 64 dimensions; the kernel's grid has one block row per head.
 const HEADS: usize = D / 64;
 
+/// f32 values per thread in a key-range partial of the layer kernel's attention
+/// (kernels/src/attn.rs's PART).
+pub const PART: usize = 36;
+
 /// `o = attention(qkv)`: `qkv` is `[n, 3·D]` (q and k in the RoPE-permuted order the qkv GEMM
 /// writes), `o` is `[n, D]`. `window`: keys with |i − j| <= window, or 0 for all (global).
 pub fn launch(

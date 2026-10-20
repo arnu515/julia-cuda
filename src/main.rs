@@ -15,6 +15,7 @@ mod checkpoint;
 mod forward;
 mod gemm;
 mod prep;
+mod profile;
 mod serve;
 mod timing;
 mod weights;
@@ -100,10 +101,9 @@ pub struct Kernels {
     /// The tensor-core GEMMs.
     gemm: gemm::GemmKernels,
     attention: CudaFunction,
-    /// The persistent layer kernels, with 32- and 64-row tiles, and how many
-    /// of their 128-thread blocks fit on an SM at once.
-    layer_32: (CudaFunction, usize),
-    layer_64: (CudaFunction, usize),
+    /// The persistent layer kernel, and how many of its 128-thread blocks
+    /// fit on an SM at once.
+    layer: (CudaFunction, usize),
     norm_add: CudaFunction,
     score: CudaFunction,
 }
@@ -140,8 +140,7 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
         gemm_tiled: module.load_function("gemm_tiled")?,
         gemm: gemm::GemmKernels::load(&module)?,
         attention: module.load_function("attention")?,
-        layer_32: layer_kernel(&module, "layer_32")?,
-        layer_64: layer_kernel(&module, "layer_64")?,
+        layer: layer_kernel(&module, "layer")?,
         norm_add: module.load_function("norm_add")?,
         score: module.load_function("score")?,
     })
@@ -574,59 +573,66 @@ fn main() -> color_eyre::Result<()> {
         let quick = |launch: &mut dyn FnMut() -> color_eyre::Result<()>| {
             timing::time(&stream, 5, 7, 30, launch)
         };
-        let mut layer_total = 0.0;
-        for (gi, &(name, nn, k)) in shapes.iter().enumerate() {
-            let flop = 2.0 * (n * nn * k) as f64;
-            let launch = |g: &mut forward::GpuEncoder, l: usize| match gi {
-                0 => g.launch_qkv(l),
-                1 => g.launch_wo(l),
-                2 => g.launch_wi(l),
-                _ => g.launch_wo_mlp(l),
-            };
-            eprintln!("  {name} ({n} × {nn} × {k}), µs per call (median), by tile and split-K:");
-            let mut best: Option<(f64, gemm::Config)> = None;
-            for shape in gemm::SHAPES {
-                let mut row = format!("    {:>5}x64", shape.name());
-                for splits in 1..=4u32 {
-                    let cfg = gemm::Config { shape, splits };
-                    if splits as usize > k / 32 {
-                        continue;
+        let n_layers = gpu.layout.layers.len();
+        for (layers, n) in [(&mut layers, n), (&mut layers_long, long.ids.len())] {
+            let mut layer_total = 0.0;
+            for (gi, &(name, nn, k)) in shapes.iter().enumerate() {
+                let flop = 2.0 * (n * nn * k) as f64;
+                let launch = |g: &mut forward::GpuEncoder, l: usize| match gi {
+                    0 => g.launch_qkv(l),
+                    1 => g.launch_wo(l),
+                    2 => g.launch_wi(l),
+                    _ => g.launch_wo_mlp(l),
+                };
+                eprintln!(
+                    "  {name} ({n} × {nn} × {k}), µs per call (median), by tile and split-K:"
+                );
+                let mut best: Option<(f64, gemm::Config)> = None;
+                for shape in gemm::SHAPES {
+                    let mut row = format!("    {:>5}x64", shape.name());
+                    for splits in 1..=4u32 {
+                        let cfg = gemm::Config { shape, splits };
+                        if splits as usize > k / 32 {
+                            continue;
+                        }
+                        layers.config = Some(cfg);
+                        let t = quick(&mut || launch(layers, 1))?;
+                        row += &format!("   split {splits} {:>6.2}", t.median_us);
+                        if best.is_none_or(|(b, _)| t.median_us < b) {
+                            best = Some((t.median_us, cfg));
+                        }
                     }
-                    layers.config = Some(cfg);
-                    let t = quick(&mut || launch(&mut layers, 1))?;
-                    row += &format!("   split {splits} {:>6.2}", t.median_us);
-                    if best.is_none_or(|(b, _)| t.median_us < b) {
-                        best = Some((t.median_us, cfg));
-                    }
+                    eprintln!("{row}");
                 }
-                eprintln!("{row}");
-            }
-            layers.config = None;
-            let chosen = layers.config_for(nn, k);
-            let mut l = 0;
-            let t = run(&mut || {
-                // Layers 1..=21 (layer 0's qkv has no LayerNorm).
-                l = l % (gpu.layout.layers.len() - 1) + 1;
-                launch(&mut layers, l)
-            })?;
-            layer_total += t.median_us;
-            let (bt, bc) = best.unwrap();
-            eprintln!(
-                "    chosen {chosen}: {:.2} µs rotating through 21 layers' weights, {:.2} TFLOP/s; \
+                layers.config = None;
+                let chosen = layers.config_for(nn, k);
+                let mut l = 0;
+                let t = run(&mut || {
+                    // Layers 1..=21 (layer 0's qkv has no LayerNorm).
+                    l = l % (gpu.layout.layers.len() - 1) + 1;
+                    launch(layers, l)
+                })?;
+                layer_total += t.median_us;
+                let (bt, bc) = best.unwrap();
+                eprintln!(
+                    "    chosen {chosen}: {:.2} µs rotating through 21 layers' weights, {:.2} TFLOP/s; \
                  fastest here {bc} ({bt:.2} µs, in L2)",
-                t.median_us,
-                flop / t.median_us / 1e6
+                    t.median_us,
+                    flop / t.median_us / 1e6
+                );
+            }
+            eprintln!(
+                "  one layer's four GEMMs: {layer_total:.1} µs; × {n_layers} layers: {:.2} ms",
+                layer_total * n_layers as f64 / 1e3
             );
         }
-        let n_layers = gpu.layout.layers.len();
-        eprintln!(
-            "  one layer's four GEMMs: {layer_total:.1} µs; × {n_layers} layers: {:.2} ms",
-            layer_total * n_layers as f64 / 1e3
-        );
 
         // Attention (layer 0 is global, layer 1 sliding-window), and the whole encoder (22 ×
         // qkv, attention, wo, wi, wo_mlp: 110 launches), for both requests.
-        for (g, tokens) in [(&mut layers, n), (&mut layers_long, long.ids.len())] {
+        for (g, tokens, x0) in [
+            (&mut layers, n, &x),
+            (&mut layers_long, long.ids.len(), &x_long),
+        ] {
             for l in [0, 1] {
                 let kind = if gpu.layout.layers[l].global {
                     "global"
@@ -639,15 +645,22 @@ fn main() -> color_eyre::Result<()> {
                     t.min_us, t.median_us
                 );
             }
-            for fused in [false, true] {
-                g.fused = fused;
+            // The per-step kernels, the layer kernel, and the layer kernel with launch boundaries in
+            // place of its grid barriers (same grid and tasks).
+            let variants = [
+                ("per-step kernels", false, false),
+                ("the layer kernel", true, false),
+                ("the layer kernel, a launch per phase", true, true),
+            ];
+            for (how, fused, split) in variants {
+                (g.fused, g.split_phases) = (fused, split);
+                let launches = match (fused, split) {
+                    (true, false) => n_layers,
+                    _ => 5 * n_layers,
+                };
                 let t = timing::time(&stream, 2, 10, 5, &mut || {
                     (0..n_layers).try_for_each(|l| g.launch_layer(l))
                 })?;
-                let (launches, how) = match fused {
-                    false => (5 * n_layers, "per-step kernels"),
-                    true => (n_layers, "the layer kernel"),
-                };
                 eprintln!(
                     "  encoder, {how} ({launches} launches), {tokens} tokens: {:.3} ms \
                      (fastest {:.3})",
@@ -655,6 +668,15 @@ fn main() -> color_eyre::Result<()> {
                     t.min_us / 1e3
                 );
             }
+            (g.fused, g.split_phases) = (false, false);
+            // The layer kernel's plan, phase by phase; then where the time goes with the default
+            // plan and with the best one.
+            let best = profile::sweep(g)?;
+            g.fused = true;
+            profile::profile(g, x0, 10, "default plan")?;
+            g.plan = Some(best);
+            profile::profile(g, x0, 10, "best plan")?;
+            // Kept for the forward pass below.
             g.fused = false;
         }
         // The head, and the whole forward pass: embed, the encoder, the head (from token ids on
@@ -672,17 +694,19 @@ fn main() -> color_eyre::Result<()> {
                 t.min_us, t.median_us
             );
             let mut x_in = stream.clone_dtod(&enc.x)?;
-            for fused in [false, true] {
-                enc.fused = fused;
+            let best = enc.plan.take();
+            for (fused, plan) in [(false, None), (true, None), (true, best)] {
+                (enc.fused, enc.plan) = (fused, plan);
                 let t = timing::time(&stream, 2, 10, 5, &mut || {
                     embed_into(&stream, &kernels, &gpu, ids, c.norm_eps, &mut x_in)?;
                     stream.memcpy_dtod(&x_in, &mut enc.x)?;
                     (0..n_layers).try_for_each(|l| enc.launch_layer(l))?;
                     h.launch_all(&enc.x, s.qtype as usize)
                 })?;
-                let (encoder, how) = match fused {
-                    false => (5 * n_layers, "per-step kernels"),
-                    true => (n_layers, "the layer kernel"),
+                let (encoder, how) = match (fused, plan) {
+                    (false, _) => (5 * n_layers, "per-step kernels".to_string()),
+                    (true, None) => (n_layers, "the layer kernel".to_string()),
+                    (true, Some(p)) => (n_layers, format!("the layer kernel, {p}")),
                 };
                 eprintln!(
                     "  forward pass, {how} ({} launches + a copy), {tokens} tokens: {:.3} ms \
@@ -693,6 +717,40 @@ fn main() -> color_eyre::Result<()> {
                 );
             }
             enc.fused = false;
+        }
+
+        // The plan sweep at more token counts (the 2000 questions have 123-607 tokens, 293 on
+        // average): the long request's tokens repeated to each length.
+        let lengths = [128, 192, 256, 320, 448, 512, 607];
+        let scratch = gemm::Scratch::new(&stream, lengths[lengths.len() - 1])?;
+        for tokens in lengths {
+            let more: Vec<u32> = long.ids.iter().cycle().take(tokens).copied().collect();
+            let x0 = embed(
+                &stream,
+                &kernels,
+                &gpu,
+                &stream.clone_htod(&more)?,
+                c.norm_eps,
+            )?;
+            let mut g = forward::GpuEncoder::new(
+                &stream,
+                &kernels,
+                &scratch,
+                &gpu,
+                c.norm_eps,
+                window,
+                sms,
+                stream.clone_dtod(&x0)?,
+                c.intermediate,
+            )?;
+            let t = timing::time(&stream, 2, 10, 5, &mut || {
+                (0..n_layers).try_for_each(|l| g.launch_layer(l))
+            })?;
+            eprintln!(
+                "  encoder, per-step kernels, {tokens} tokens: {:.3} ms",
+                t.median_us / 1e3
+            );
+            profile::sweep(&mut g)?;
         }
     }
     Ok(())

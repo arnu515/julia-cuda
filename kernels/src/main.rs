@@ -10,6 +10,7 @@ use cuda_host::cuda_module;
 mod attn;
 mod gemm;
 mod helpers;
+mod prof;
 
 // Embedding constants
 /// Hidden size of the model
@@ -287,6 +288,13 @@ mod kernels {
     /// Attention for queries q0..q0 + 64 of head `head`, through the shared tiles qs, ks, vs
     /// (each [64][64] f16): the body of `attention`, and a task of the layer kernel. Every thread
     /// of the block runs it.
+    ///
+    /// With `chunks` > 1, the key blocks are split into `chunks` contiguous ranges and this task
+    /// does range `chunk` only, as split-K does for the GEMMs: each range's task writes its
+    /// unnormalized output, running max and sum to `ws` (attn::PART floats per thread), and the
+    /// last of the (q0, head) tile to arrive (counted in `counters`, which it resets) merges them
+    /// in range order and stores o. `ws`, `counters` and `last` (one shared u32) are unused with
+    /// one chunk.
     #[device]
     #[allow(clippy::too_many_arguments)]
     fn attention_task(
@@ -296,6 +304,11 @@ mod kernels {
         window: u32,
         q0: u32,
         head: u32,
+        chunk: u32,
+        chunks: u32,
+        ws: *mut f32,
+        counters: *mut u32,
+        last: *mut u32,
         qs: *mut u16,
         ks: *mut u16,
         vs: *mut u16,
@@ -303,19 +316,8 @@ mod kernels {
         let tid = thread::threadIdx_x();
         let (lane, warp) = (tid & 31, tid >> 5);
 
-        attn::load_tile(qkv, qs, n, q0, head, 0);
-        thread::sync_threads();
-        // This warp's 16 queries as A fragments, one per 16 dimensions.
-        let mut qf = [[0u32; 4]; 4];
-        #[unroll]
-        for ks_ in 0..4u32 {
-            qf[ks_ as usize] = gemm::ldsm_x4(attn::at(
-                qs,
-                attn::swz64(warp * 16 + (lane & 15), ks_ * 2 + (lane >> 4)),
-            ));
-        }
-
-        // Key blocks: all, or those the window of any of this block's queries reaches.
+        // Key blocks: all, or those the window of any of this block's queries reaches; then this
+        // chunk's share of them (possibly none).
         let nb = n.div_ceil(attn::BQ as u32);
         let (kb0, kb1) = if window == 0 {
             (0, nb)
@@ -324,6 +326,22 @@ mod kernels {
             let hi = ((q0 + attn::BQ as u32 - 1 + window).min(n - 1)) / attn::BQ as u32 + 1;
             (lo, hi)
         };
+        let nkb = kb1 - kb0;
+        let (kb0, kb1) = (kb0 + chunk * nkb / chunks, kb0 + (chunk + 1) * nkb / chunks);
+
+        // This warp's 16 queries as A fragments, one per 16 dimensions.
+        let mut qf = [[0u32; 4]; 4];
+        if kb0 < kb1 {
+            attn::load_tile(qkv, qs, n, q0, head, 0);
+            thread::sync_threads();
+            #[unroll]
+            for ks_ in 0..4u32 {
+                qf[ks_ as usize] = gemm::ldsm_x4(attn::at(
+                    qs,
+                    attn::swz64(warp * 16 + (lane & 15), ks_ * 2 + (lane >> 4)),
+                ));
+            }
+        }
         // 1/√64 and log2(e), so the softmax is a bare exp2.
         let scale = core::f32::consts::LOG2_E / 8.0;
         let (g, t) = (lane >> 2, lane & 3);
@@ -431,6 +449,27 @@ mod kernels {
             kb += 1;
         }
 
+        if chunks > 1 {
+            // SAFETY: the caller sizes ws (attn::PART floats per thread per (tile, chunk)) and
+            // zeroes counters (one per (q0, head) tile); last is shared; the whole block is here.
+            let merged = unsafe {
+                attn::split_merge(
+                    &mut acc,
+                    &mut sum,
+                    &mut mx,
+                    ws,
+                    counters,
+                    (q0 / attn::BQ as u32) * 6 + head,
+                    chunk,
+                    chunks,
+                    last,
+                )
+            };
+            if !merged {
+                return;
+            }
+        }
+
         #[unroll]
         for h in 0..2usize {
             let mut l = sum[h];
@@ -456,7 +495,7 @@ mod kernels {
                 }
             }
         }
-        }
+    }
 
     #[kernel]
     pub fn attention(qkv: *const u16, o: *mut u16, n: u32, window: u32) {
@@ -475,6 +514,11 @@ mod kernels {
             window,
             thread::blockIdx_x() * attn::BQ as u32,
             thread::blockIdx_y(),
+            0,
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
             qs,
             ks,
             vs,
@@ -494,155 +538,292 @@ mod kernels {
     // phases, each a list of tasks that every block strides over, with a grid barrier between
     // phases. The tasks are the per-step kernels' own (gemm_tile, attention_task), so the
     // arithmetic is theirs. Grid: at most as many blocks as fit on the GPU at once (a
-    // cooperative launch), 128 threads; tiles BM × 64 (layer_32: BM 32, layer_64: BM 64).
+    // cooperative launch), 128 threads.
     //
     // Phases: qkv (+ RoPE; LayerNorm folded in when qkv_colsum isn't null), attention, wo
-    // (+ residual, statistics into stats_attn; split-K), wi (LayerNorm, GeGLU), wo_mlp (+ residual,
-    // statistics into stats_mlp; split-K). stats_attn is cleared before the first phase (its last
-    // reader was the previous layer's wi), stats_mlp during wo (its reader, qkv, is done).
+    // (+ residual, statistics into stats_attn), wi (LayerNorm, GeGLU), wo_mlp (+ residual,
+    // statistics into stats_mlp). stats_attn is cleared before the first phase (its last reader
+    // was the previous layer's wi), stats_mlp during wo (its reader, qkv, is done).
     //
-    // `bar` counts barrier arrivals over the kernel's lifetime: this launch's barriers wait for
-    // bar_base + p·gridDim.x arrivals (p = 1..4), and the host adds 4·gridDim.x per launch.
+    // Each GEMM phase has its own tile height and split-K, `mis` and `splits` holding 4 bits per
+    // GEMM (qkv, wo, wi, wo_mlp from the low end): MI 1 (32-row tiles) or 2 (64-row), 1-4
+    // splits. Attention splits each (64 queries, head) tile's key blocks into `kv_chunks` tasks.
+    // The split-K and key-range partials share `ws` and `counters` (their phases don't overlap).
+    //
+    // `phases` bits 0-4 select which phases run, with a grid barrier between two consecutive
+    // selected phases only: 0x1f is the whole layer; one bit runs one phase, as a plain launch
+    // per phase would (for measuring what the barriers cost against launch boundaries). Bit 8:
+    // the original two-fence barrier (gemm::grid_sync) instead of grid_sync_lean. `bar` counts
+    // barrier arrivals over the kernel's lifetime: the b-th barrier of this launch waits for
+    // bar_base + b·gridDim.x arrivals, and the host adds (barriers per launch)·gridDim.x per
+    // launch.
+    //
+    // `prof`, when not null, gets timestamps (see `prof`): PROF_WORDS u64 per block.
+    #[kernel]
+    pub fn layer(
+        x: *mut u16,
+        qkv: *mut u16,
+        o: *mut u16,
+        mbuf: *mut u16,
+        stats_attn: *mut f32,
+        stats_mlp: *mut f32,
+        ws: *mut f32,
+        counters: *mut u32,
+        bar: *mut u32,
+        bar_base: u32,
+        wqkv: *const u16,
+        qkv_colsum: *const f32,
+        rope: *const f32,
+        wo: *const u16,
+        wi: *const u16,
+        wi_colsum: *const f32,
+        wo_mlp: *const u16,
+        m: u32,
+        inter: u32,
+        eps: f32,
+        window: u32,
+        mis: u32,
+        splits: u32,
+        kv_chunks: u32,
+        phases: u32,
+        prof: *mut u64,
+    ) {
+        // GEMM stages and attention's three tiles share one buffer, phase by phase.
+        static mut SMEM: SharedArray<u16, { 3 * attn::BQ * attn::HD }, 128> = SharedArray::UNINIT;
+        static mut LAST: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+        let smem = core::ptr::addr_of_mut!(SMEM) as *mut u16;
+        let last = core::ptr::addr_of_mut!(LAST) as *mut u32;
+        let tile_halves = attn::BQ * attn::HD;
+        // SAFETY: three [64][64] tiles in SMEM.
+        let (qs, ks, vs) = unsafe { (smem, smem.add(tile_halves), smem.add(2 * tile_halves)) };
+        let (blk, nblk, tid) = (
+            thread::blockIdx_x(),
+            thread::gridDim_x(),
+            thread::threadIdx_x(),
+        );
+        let null = core::ptr::null::<f32>();
+        let (d, d3) = (attn::D as u32, 3 * attn::D as u32);
+        let mi = |g: u32| (mis >> (4 * g)) & 15;
+        let sp = |g: u32| (splits >> (4 * g)) & 15;
+        let rows = |g: u32| m.div_ceil(32 * mi(g));
+        let on = |p: u32| (phases >> p) & 1 != 0;
+        let lean = (phases >> 8) & 1 == 0;
+        // Barriers passed so far in this launch.
+        let mut nbar = 0u32;
 
-    macro_rules! layer {
-        ($name:ident, $mi:literal) => {
-            #[kernel]
-            pub fn $name(
-                x: *mut u16,
-                qkv: *mut u16,
-                o: *mut u16,
-                mbuf: *mut u16,
-                stats_attn: *mut f32,
-                stats_mlp: *mut f32,
-                ws: *mut f32,
-                counters: *mut u32,
-                bar: *mut u32,
-                bar_base: u32,
-                wqkv: *const u16,
-                qkv_colsum: *const f32,
-                rope: *const f32,
-                wo: *const u16,
-                wi: *const u16,
-                wi_colsum: *const f32,
-                wo_mlp: *const u16,
-                m: u32,
-                inter: u32,
-                eps: f32,
-                window: u32,
-                splits_wo: u32,
-                splits_wo_mlp: u32,
-            ) {
-                // GEMM stages and attention's three tiles share one buffer, phase by phase.
-                static mut SMEM: SharedArray<u16, { 3 * attn::BQ * attn::HD }, 128> =
-                    SharedArray::UNINIT;
-                static mut LAST: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-                let smem = core::ptr::addr_of_mut!(SMEM) as *mut u16;
-                let last = core::ptr::addr_of_mut!(LAST) as *mut u32;
-                let tile_halves = attn::BQ * attn::HD;
-                // SAFETY: three [64][64] tiles in SMEM.
-                let (qs, ks, vs) =
-                    unsafe { (smem, smem.add(tile_halves), smem.add(2 * tile_halves)) };
-                let (blk, nblk, tid) = (thread::blockIdx_x(), thread::gridDim_x(), thread::threadIdx_x());
-                let null = core::ptr::null::<f32>();
-                let (d, d3) = (attn::D as u32, 3 * attn::D as u32);
-                let row_tiles = m.div_ceil(16 * $mi * 2);
-
-                // Clear stats_attn, which wo accumulates into.
-                let mut i = blk * 128 + tid;
-                while i < 2 * m {
-                    // SAFETY: stats_attn has 2m values.
-                    unsafe { *stats_attn.add(i as usize) = 0.0 };
-                    i += nblk * 128;
-                }
-
-                // qkv: x → qkv, LayerNorm (from layer 1) and RoPE.
-                let mut t = blk;
-                while t < (d3 / 64) * row_tiles {
-                    let tile = gemm::Tile::of_task(t, d3 / 64, 1);
-                    if qkv_colsum.is_null() {
-                        gemm_tile::<$mi, 2, EPI_ROPE>(
-                            tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
-                            null as _, m, d3, d, eps, rope, null, smem, last,
-                        );
-                    } else {
-                        gemm_tile::<$mi, 2, { EPI_LN | EPI_ROPE }>(
-                            tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
-                            null as _, m, d3, d, eps, rope, null, smem, last,
-                        );
-                    }
-                    t += nblk;
-                }
-                // SAFETY: every thread of every block gets here, once per phase; the host
-                // launches cooperatively.
-                unsafe { gemm::grid_sync(bar, bar_base.wrapping_add(nblk)) };
-
-                // Attention: qkv → o, a task per (64 queries, head), heads adjacent.
-                let mut t = blk;
-                while t < m.div_ceil(attn::BQ as u32) * 6 {
-                    attention_task(
-                        qkv,
-                        o,
-                        m,
-                        window,
-                        (t / 6) * attn::BQ as u32,
-                        t % 6,
-                        qs,
-                        ks,
-                        vs,
-                    );
-                    t += nblk;
-                }
-                // SAFETY: as above.
-                unsafe { gemm::grid_sync(bar, bar_base.wrapping_add(2 * nblk)) };
-
-                // Clear stats_mlp, which wo_mlp accumulates into (qkv has read it).
-                let mut i = blk * 128 + tid;
-                while i < 2 * m {
-                    // SAFETY: stats_mlp has 2m values.
-                    unsafe { *stats_mlp.add(i as usize) = 0.0 };
-                    i += nblk * 128;
-                }
-                // wo: x += o · Woᵀ, row statistics into stats_attn.
-                let mut t = blk;
-                while t < (d / 64) * row_tiles * splits_wo {
-                    gemm_tile::<$mi, 2, { EPI_RES | EPI_STATS }>(
-                        gemm::Tile::of_task(t, d / 64, splits_wo),
-                        o, wo, x, x, ws, counters, null, null, stats_attn, m, d, d, eps, null,
-                        null, smem, last,
-                    );
-                    t += nblk;
-                }
-                // SAFETY: as above.
-                unsafe { gemm::grid_sync(bar, bar_base.wrapping_add(3 * nblk)) };
-
-                // wi: m = GeGLU(LN(x) · Wiᵀ).
-                let mut t = blk;
-                while t < (2 * inter / 64) * row_tiles {
-                    gemm_tile::<$mi, 2, { EPI_LN | EPI_GEGLU }>(
-                        gemm::Tile::of_task(t, 2 * inter / 64, 1),
-                        x, wi, mbuf, null as _, ws, counters, stats_attn, wi_colsum, null as _, m,
-                        2 * inter, d, eps, null, null, smem, last,
-                    );
-                    t += nblk;
-                }
-                // SAFETY: as above.
-                unsafe { gemm::grid_sync(bar, bar_base.wrapping_add(4 * nblk)) };
-
-                // wo_mlp: x += m · Wo_mlpᵀ, row statistics into stats_mlp.
-                let mut t = blk;
-                while t < (d / 64) * row_tiles * splits_wo_mlp {
-                    gemm_tile::<$mi, 2, { EPI_RES | EPI_STATS }>(
-                        gemm::Tile::of_task(t, d / 64, splits_wo_mlp),
-                        mbuf, wo_mlp, x, x, ws, counters, null, null, stats_mlp, m, d, inter, eps,
-                        null, null, smem, last,
-                    );
-                    t += nblk;
-                }
+        // qkv: x → qkv, LayerNorm (from layer 1) and RoPE.
+        if on(0) {
+            // SAFETY: prof is null or has PROF_WORDS per block; stamp 0 starts phase 0.
+            unsafe { prof::stamp(prof, 0, 0) };
+            // Clear stats_attn, which wo accumulates into.
+            let mut i = blk * 128 + tid;
+            while i < 2 * m {
+                // SAFETY: stats_attn has 2m values.
+                unsafe { *stats_attn.add(i as usize) = 0.0 };
+                i += nblk * 128;
             }
-        };
+            let mut t = blk;
+            while t < (d3 / 64) * rows(0) * sp(0) {
+                let tile = gemm::Tile::of_task(t, d3 / 64, sp(0));
+                match (qkv_colsum.is_null(), mi(0)) {
+                    (true, 1) => gemm_tile::<1, 2, EPI_ROPE>(
+                        tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
+                        null as _, m, d3, d, eps, rope, null, smem, last,
+                    ),
+                    (true, _) => gemm_tile::<2, 2, EPI_ROPE>(
+                        tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
+                        null as _, m, d3, d, eps, rope, null, smem, last,
+                    ),
+                    (false, 1) => gemm_tile::<1, 2, { EPI_LN | EPI_ROPE }>(
+                        tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
+                        null as _, m, d3, d, eps, rope, null, smem, last,
+                    ),
+                    (false, _) => gemm_tile::<2, 2, { EPI_LN | EPI_ROPE }>(
+                        tile, x, wqkv, qkv, null as _, ws, counters, stats_mlp, qkv_colsum,
+                        null as _, m, d3, d, eps, rope, null, smem, last,
+                    ),
+                }
+                t += nblk;
+            }
+            // SAFETY: as above; every thread of the block gets here.
+            unsafe { prof::stamp_end(prof, 0) };
+            if on(1) {
+                nbar += 1;
+                // SAFETY: every thread of every block gets here, once per barrier; the host
+                // launches cooperatively whenever two consecutive phases run.
+                unsafe { layer_sync(lean, bar, bar_base.wrapping_add(nbar * nblk)) };
+            }
+        }
+
+        // Attention: qkv → o, a task per (64 queries, head, key range), heads and ranges
+        // adjacent.
+        if on(1) {
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp(prof, 1, 2) };
+            let mut t = blk;
+            while t < m.div_ceil(attn::BQ as u32) * 6 * kv_chunks {
+                let tile = t / kv_chunks;
+                attention_task(
+                    qkv,
+                    o,
+                    m,
+                    window,
+                    (tile / 6) * attn::BQ as u32,
+                    tile % 6,
+                    t % kv_chunks,
+                    kv_chunks,
+                    ws,
+                    counters,
+                    last,
+                    qs,
+                    ks,
+                    vs,
+                );
+                t += nblk;
+            }
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp_end(prof, 1) };
+            if on(2) {
+                nbar += 1;
+                // SAFETY: as above.
+                unsafe { layer_sync(lean, bar, bar_base.wrapping_add(nbar * nblk)) };
+            }
+        }
+
+        // wo: x += o · Woᵀ, row statistics into stats_attn.
+        if on(2) {
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp(prof, 2, 4) };
+            // Clear stats_mlp, which wo_mlp accumulates into (qkv has read it).
+            let mut i = blk * 128 + tid;
+            while i < 2 * m {
+                // SAFETY: stats_mlp has 2m values.
+                unsafe { *stats_mlp.add(i as usize) = 0.0 };
+                i += nblk * 128;
+            }
+            let mut t = blk;
+            while t < (d / 64) * rows(1) * sp(1) {
+                let tile = gemm::Tile::of_task(t, d / 64, sp(1));
+                match mi(1) {
+                    1 => gemm_tile::<1, 2, { EPI_RES | EPI_STATS }>(
+                        tile, o, wo, x, x, ws, counters, null, null, stats_attn, m, d, d, eps,
+                        null, null, smem, last,
+                    ),
+                    _ => gemm_tile::<2, 2, { EPI_RES | EPI_STATS }>(
+                        tile, o, wo, x, x, ws, counters, null, null, stats_attn, m, d, d, eps,
+                        null, null, smem, last,
+                    ),
+                }
+                t += nblk;
+            }
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp_end(prof, 2) };
+            if on(3) {
+                nbar += 1;
+                // SAFETY: as above.
+                unsafe { layer_sync(lean, bar, bar_base.wrapping_add(nbar * nblk)) };
+            }
+        }
+
+        // wi: m = GeGLU(LN(x) · Wiᵀ).
+        if on(3) {
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp(prof, 3, 6) };
+            let mut t = blk;
+            while t < (2 * inter / 64) * rows(2) * sp(2) {
+                let tile = gemm::Tile::of_task(t, 2 * inter / 64, sp(2));
+                match mi(2) {
+                    1 => gemm_tile::<1, 2, { EPI_LN | EPI_GEGLU }>(
+                        tile,
+                        x,
+                        wi,
+                        mbuf,
+                        null as _,
+                        ws,
+                        counters,
+                        stats_attn,
+                        wi_colsum,
+                        null as _,
+                        m,
+                        2 * inter,
+                        d,
+                        eps,
+                        null,
+                        null,
+                        smem,
+                        last,
+                    ),
+                    _ => gemm_tile::<2, 2, { EPI_LN | EPI_GEGLU }>(
+                        tile,
+                        x,
+                        wi,
+                        mbuf,
+                        null as _,
+                        ws,
+                        counters,
+                        stats_attn,
+                        wi_colsum,
+                        null as _,
+                        m,
+                        2 * inter,
+                        d,
+                        eps,
+                        null,
+                        null,
+                        smem,
+                        last,
+                    ),
+                }
+                t += nblk;
+            }
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp_end(prof, 3) };
+            if on(4) {
+                nbar += 1;
+                // SAFETY: as above.
+                unsafe { layer_sync(lean, bar, bar_base.wrapping_add(nbar * nblk)) };
+            }
+        }
+
+        // wo_mlp: x += m · Wo_mlpᵀ, row statistics into stats_mlp.
+        if on(4) {
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp(prof, 4, 8) };
+            let mut t = blk;
+            while t < (d / 64) * rows(3) * sp(3) {
+                let tile = gemm::Tile::of_task(t, d / 64, sp(3));
+                match mi(3) {
+                    1 => gemm_tile::<1, 2, { EPI_RES | EPI_STATS }>(
+                        tile, mbuf, wo_mlp, x, x, ws, counters, null, null, stats_mlp, m, d, inter,
+                        eps, null, null, smem, last,
+                    ),
+                    _ => gemm_tile::<2, 2, { EPI_RES | EPI_STATS }>(
+                        tile, mbuf, wo_mlp, x, x, ws, counters, null, null, stats_mlp, m, d, inter,
+                        eps, null, null, smem, last,
+                    ),
+                }
+                t += nblk;
+            }
+            // SAFETY: as for phase 0.
+            unsafe { prof::stamp_end(prof, 4) };
+        }
     }
-    layer!(layer_32, 1);
-    layer!(layer_64, 2);
+
+    /// The layer kernel's grid barrier: `gemm::grid_sync_lean`, or `grid_sync` (for comparison).
+    ///
+    /// # Safety
+    /// As `gemm::grid_sync`.
+    #[inline(always)]
+    unsafe fn layer_sync(lean: bool, bar: *mut u32, target: u32) {
+        // SAFETY: the caller's guarantees are grid_sync's.
+        unsafe {
+            if lean {
+                gemm::grid_sync_lean(bar, target)
+            } else {
+                gemm::grid_sync(bar, target)
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------------------------
     // The tensor-core GEMM (see gemm.rs), with fused epilogues:
@@ -706,148 +887,141 @@ mod kernels {
         smem: *mut u16,
         last: *mut u32,
     ) {
-            let tid = thread::threadIdx_x();
-            let mut acc = [[[0f32; 4]; 4]; MI];
-            gemm::mainloop::<MI, WR>(&mut acc, a, w, m, k, tile, smem);
-            // SAFETY: the caller sizes ws and zeroes counters for split-K.
-            if !unsafe { gemm::split_reduce::<MI, WR>(&mut acc, ws, counters, tile, last) } {
-                // A split that isn't the tile's last: the last one runs the epilogue.
-                return;
-            }
-            // The epilogue's loops live here: #[unroll] works only in kernels and #[device]
-            // functions, and LLVM won't inline a #[device] function this large.
-            let (lane, warp) = (tid & 31, tid >> 5);
-            let r0 =
-                tile.by * 16 * MI as u32 * WR + (warp >> 1) * 16 * MI as u32 + (lane >> 2);
-            // The (packed) W row, i.e. output column, of fragment j = 0.
-            let cw = tile.bx * 64 + (warp & 1) * 32 + (lane & 3) * 2;
+        let tid = thread::threadIdx_x();
+        let mut acc = [[[0f32; 4]; 4]; MI];
+        gemm::mainloop::<MI, WR>(&mut acc, a, w, m, k, tile, smem);
+        // SAFETY: the caller sizes ws and zeroes counters for split-K.
+        if !unsafe { gemm::split_reduce::<MI, WR>(&mut acc, ws, counters, tile, last) } {
+            // A split that isn't the tile's last: the last one runs the epilogue.
+            return;
+        }
+        // The epilogue's loops live here: #[unroll] works only in kernels and #[device]
+        // functions, and LLVM won't inline a #[device] function this large.
+        let (lane, warp) = (tid & 31, tid >> 5);
+        let r0 = tile.by * 16 * MI as u32 * WR + (warp >> 1) * 16 * MI as u32 + (lane >> 2);
+        // The (packed) W row, i.e. output column, of fragment j = 0.
+        let cw = tile.bx * 64 + (warp & 1) * 32 + (lane & 3) * 2;
+        #[unroll]
+        for i in 0..MI {
             #[unroll]
-            for i in 0..MI {
+            for h in 0..2usize {
+                let r = r0 + i as u32 * 16 + h as u32 * 8;
+                let ok = r < m;
+                let mut v = [[0f32; 2]; 4];
                 #[unroll]
-                for h in 0..2usize {
-                    let r = r0 + i as u32 * 16 + h as u32 * 8;
-                    let ok = r < m;
-                    let mut v = [[0f32; 2]; 4];
+                for j in 0..4usize {
+                    v[j] = [acc[i][j][2 * h], acc[i][j][2 * h + 1]];
+                }
+                if (EPI & EPI_LN) != 0 && ok {
+                    // SAFETY: stats_in has 2m values and r < m.
+                    let (mean, rstd) = unsafe { gemm::ln_stats(stats_in, r, k, eps) };
                     #[unroll]
                     for j in 0..4usize {
-                        v[j] = [acc[i][j][2 * h], acc[i][j][2 * h + 1]];
+                        let col = (cw + j as u32 * 8) as usize;
+                        // SAFETY: colsum has n values and col + 1 < n.
+                        let (s0, s1) = unsafe { (*colsum.add(col), *colsum.add(col + 1)) };
+                        v[j] = [rstd * (v[j][0] - mean * s0), rstd * (v[j][1] - mean * s1)];
                     }
-                    if (EPI & EPI_LN) != 0 && ok {
-                        // SAFETY: stats_in has 2m values and r < m.
-                        let (mean, rstd) = unsafe { gemm::ln_stats(stats_in, r, k, eps) };
-                        #[unroll]
-                        for j in 0..4usize {
-                            let col = (cw + j as u32 * 8) as usize;
-                            // SAFETY: colsum has n values and col + 1 < n.
-                            let (s0, s1) = unsafe { (*colsum.add(col), *colsum.add(col + 1)) };
-                            v[j] = [rstd * (v[j][0] - mean * s0), rstd * (v[j][1] - mean * s1)];
+                }
+                if (EPI & EPI_BIAS) != 0 {
+                    #[unroll]
+                    for j in 0..4usize {
+                        let col = (cw + j as u32 * 8) as usize;
+                        // SAFETY: bias has n values and col + 1 < n.
+                        let (b0, b1) = unsafe { (*bias.add(col), *bias.add(col + 1)) };
+                        v[j] = [v[j][0] + b0, v[j][1] + b1];
+                    }
+                }
+                if (EPI & EPI_RELU) != 0 {
+                    #[unroll]
+                    for j in 0..4usize {
+                        v[j] = [v[j][0].max(0.0), v[j][1].max(0.0)];
+                    }
+                }
+                if (EPI & EPI_GELU) != 0 {
+                    #[unroll]
+                    for j in 0..4usize {
+                        v[j] = [gemm::gelu(v[j][0]), gemm::gelu(v[j][1])];
+                    }
+                }
+                if (EPI & EPI_ROPE) != 0 && ok {
+                    #[unroll]
+                    for j in 0..4usize {
+                        let col = cw + j as u32 * 8;
+                        // q and k are the first two thirds of qkv; a warp's 32 columns
+                        // lie in one 64-column head, so this is the same for the warp.
+                        if col < 2 * (n / 3) {
+                            let pair = ((col % 64) / 2) as usize;
+                            // SAFETY: the table has (cos, sin) for 32 pairs of at least
+                            // m positions (the host checks), and r < m.
+                            let (cs, sn) = unsafe {
+                                let t = rope.add((r as usize * 32 + pair) * 2);
+                                (*t, *t.add(1))
+                            };
+                            // julia-rs: x1·c − x2·s, x2·c + x1·s (x1 = dim i, x2 = i + 32).
+                            let [x1, x2] = v[j];
+                            v[j] = [x1 * cs - x2 * sn, x2 * cs + x1 * sn];
                         }
                     }
-                    if (EPI & EPI_BIAS) != 0 {
-                        #[unroll]
-                        for j in 0..4usize {
-                            let col = (cw + j as u32 * 8) as usize;
-                            // SAFETY: bias has n values and col + 1 < n.
-                            let (b0, b1) = unsafe { (*bias.add(col), *bias.add(col + 1)) };
-                            v[j] = [v[j][0] + b0, v[j][1] + b1];
+                }
+                if (EPI & EPI_GEGLU) != 0 {
+                    let c0 = tile.bx * 32 + (warp & 1) * 16 + (lane & 3) * 2;
+                    #[unroll]
+                    for q in 0..2usize {
+                        if ok {
+                            let (x, g) = (v[2 * q], v[2 * q + 1]);
+                            let idx = r as usize * (n / 2) as usize + (c0 + q as u32 * 8) as usize;
+                            let out = gemm::pack(gemm::gelu(x[0]) * g[0], gemm::gelu(x[1]) * g[1]);
+                            // SAFETY: r < m and the column < n/2; 4-byte aligned (even
+                            // column); each (r, column pair) has one owner.
+                            unsafe { *(c.add(idx) as *mut u32) = out };
                         }
                     }
-                    if (EPI & EPI_RELU) != 0 {
-                        #[unroll]
-                        for j in 0..4usize {
-                            v[j] = [v[j][0].max(0.0), v[j][1].max(0.0)];
-                        }
-                    }
-                    if (EPI & EPI_GELU) != 0 {
-                        #[unroll]
-                        for j in 0..4usize {
-                            v[j] = [gemm::gelu(v[j][0]), gemm::gelu(v[j][1])];
-                        }
-                    }
-                    if (EPI & EPI_ROPE) != 0 && ok {
-                        #[unroll]
-                        for j in 0..4usize {
-                            let col = cw + j as u32 * 8;
-                            // q and k are the first two thirds of qkv; a warp's 32 columns
-                            // lie in one 64-column head, so this is the same for the warp.
-                            if col < 2 * (n / 3) {
-                                let pair = ((col % 64) / 2) as usize;
-                                // SAFETY: the table has (cos, sin) for 32 pairs of at least
-                                // m positions (the host checks), and r < m.
-                                let (cs, sn) = unsafe {
-                                    let t = rope.add((r as usize * 32 + pair) * 2);
-                                    (*t, *t.add(1))
-                                };
-                                // julia-rs: x1·c − x2·s, x2·c + x1·s (x1 = dim i, x2 = i + 32).
-                                let [x1, x2] = v[j];
-                                v[j] = [x1 * cs - x2 * sn, x2 * cs + x1 * sn];
+                } else {
+                    let (mut s, mut s2) = (0f32, 0f32);
+                    #[unroll]
+                    for j in 0..4usize {
+                        if ok {
+                            let idx = r as usize * n as usize + (cw + j as u32 * 8) as usize;
+                            let (mut lo, mut hi) = (v[j][0], v[j][1]);
+                            if (EPI & EPI_RES) != 0 {
+                                // SAFETY: res is [m, n] like c; this thread reads only
+                                // the pair it writes next, so aliasing c is fine.
+                                let (x, y) = gemm::unpack(unsafe { *(res.add(idx) as *const u32) });
+                                lo += x;
+                                hi += y;
+                            }
+                            let packed = gemm::pack(lo, hi);
+                            // SAFETY: r < m and the column < n; 4-byte aligned (even
+                            // column); each (r, column pair) has one owner.
+                            unsafe { *(c.add(idx) as *mut u32) = packed };
+                            if (EPI & EPI_STATS) != 0 {
+                                let (x, y) = gemm::unpack(packed);
+                                s += x + y;
+                                s2 += x * x + y * y;
                             }
                         }
                     }
-                    if (EPI & EPI_GEGLU) != 0 {
-                        let c0 = tile.bx * 32 + (warp & 1) * 16 + (lane & 3) * 2;
-                        #[unroll]
-                        for q in 0..2usize {
-                            if ok {
-                                let (x, g) = (v[2 * q], v[2 * q + 1]);
-                                let idx = r as usize * (n / 2) as usize
-                                    + (c0 + q as u32 * 8) as usize;
-                                let out = gemm::pack(
-                                    gemm::gelu(x[0]) * g[0],
-                                    gemm::gelu(x[1]) * g[1],
-                                );
-                                // SAFETY: r < m and the column < n/2; 4-byte aligned (even
-                                // column); each (r, column pair) has one owner.
-                                unsafe { *(c.add(idx) as *mut u32) = out };
-                            }
+                    if (EPI & EPI_STATS) != 0 {
+                        // The 4 lanes of a row hold its 32 columns of this warp.
+                        // SAFETY: the whole warp is here (`ok` only guards stores).
+                        unsafe {
+                            s += gemm::shfl_xor(s, 1);
+                            s2 += gemm::shfl_xor(s2, 1);
+                            s += gemm::shfl_xor(s, 2);
+                            s2 += gemm::shfl_xor(s2, 2);
                         }
-                    } else {
-                        let (mut s, mut s2) = (0f32, 0f32);
-                        #[unroll]
-                        for j in 0..4usize {
-                            if ok {
-                                let idx =
-                                    r as usize * n as usize + (cw + j as u32 * 8) as usize;
-                                let (mut lo, mut hi) = (v[j][0], v[j][1]);
-                                if (EPI & EPI_RES) != 0 {
-                                    // SAFETY: res is [m, n] like c; this thread reads only
-                                    // the pair it writes next, so aliasing c is fine.
-                                    let (x, y) =
-                                        gemm::unpack(unsafe { *(res.add(idx) as *const u32) });
-                                    lo += x;
-                                    hi += y;
-                                }
-                                let packed = gemm::pack(lo, hi);
-                                // SAFETY: r < m and the column < n; 4-byte aligned (even
-                                // column); each (r, column pair) has one owner.
-                                unsafe { *(c.add(idx) as *mut u32) = packed };
-                                if (EPI & EPI_STATS) != 0 {
-                                    let (x, y) = gemm::unpack(packed);
-                                    s += x + y;
-                                    s2 += x * x + y * y;
-                                }
-                            }
-                        }
-                        if (EPI & EPI_STATS) != 0 {
-                            // The 4 lanes of a row hold its 32 columns of this warp.
-                            // SAFETY: the whole warp is here (`ok` only guards stores).
+                        if ok && (lane & 3) == 0 {
+                            // SAFETY: stats_out has 2m values and r < m.
                             unsafe {
-                                s += gemm::shfl_xor(s, 1);
-                                s2 += gemm::shfl_xor(s2, 1);
-                                s += gemm::shfl_xor(s, 2);
-                                s2 += gemm::shfl_xor(s2, 2);
-                            }
-                            if ok && (lane & 3) == 0 {
-                                // SAFETY: stats_out has 2m values and r < m.
-                                unsafe {
-                                    gemm::red_add(stats_out.add(2 * r as usize), s);
-                                    gemm::red_add(stats_out.add(2 * r as usize + 1), s2);
-                                }
+                                gemm::red_add(stats_out.add(2 * r as usize), s);
+                                gemm::red_add(stats_out.add(2 * r as usize + 1), s2);
                             }
                         }
                     }
                 }
             }
+        }
     }
 
     /// gemm_{shape}_{epilogue}(a, w, c, res, ws, counters, stats_in, colsum, stats_out, zero,

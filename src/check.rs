@@ -18,7 +18,7 @@ use julia_rs::{
     mlp::{geglu, gelu_inplace},
 };
 
-use crate::{D, gemm, weights::HostWeights};
+use crate::{D, forward::LayerPlan, gemm, weights::HostWeights};
 
 /// julia-rs's model, for its reference outputs.
 pub fn reference_model(dir: &Path) -> color_eyre::Result<Model> {
@@ -670,12 +670,12 @@ pub fn layer_kernel(
     traces: &[LayerTrace],
     x0: &cudarc::driver::CudaSlice<f16>,
 ) -> color_eyre::Result<()> {
-    let (_, bm, grid, splits) = g.layer_kernel()?;
     let n = g.rows();
     eprintln!(
-        "the layer kernel (one launch per layer), {n} tokens: {bm}-row tiles, {grid} blocks, \
-         split-K {} for wo and {} for wo_mlp (relative error of the stream after each layer)",
-        splits[0], splits[1]
+        "the layer kernel (one launch per layer), {n} tokens: {}, {} blocks (relative error of \
+         the stream after each layer)",
+        g.plan(),
+        g.layer_grid(1)
     );
     let mut per_layer = 0f64;
     for (l, t) in traces.iter().enumerate() {
@@ -683,39 +683,77 @@ pub fn layer_kernel(
         g.launch_layer_fused(l)?;
         per_layer = per_layer.max(rel_err(&to_f32(&g.stream.clone_dtoh(&g.x)?), &t.x_out));
     }
-    let mut chain = |fused: bool| -> color_eyre::Result<Vec<Vec<f16>>> {
-        g.fused = fused;
-        g.stream.memcpy_dtod(x0, &mut g.x)?;
-        (0..traces.len())
-            .map(|l| {
-                g.launch_layer(l)?;
-                Ok(g.stream.clone_dtoh(&g.x)?)
-            })
-            .collect()
-    };
-    let steps = chain(false)?;
-    let fused = chain(true)?;
-    g.fused = false;
-    eprintln!("  layer   chained: vs julia-rs   vs the per-step kernels");
-    let (mut worst_ref, mut worst_steps) = (0f64, 0f64);
-    for (l, ((x, s), t)) in fused.iter().zip(&steps).zip(traces).enumerate() {
-        let (r, d) = (
+    let default = g.default_plan();
+    let mut chain =
+        |fused: bool, split: bool, plan: Option<LayerPlan>| -> color_eyre::Result<Vec<Vec<f16>>> {
+            (g.fused, g.split_phases, g.plan) = (fused, split, plan);
+            g.stream.memcpy_dtod(x0, &mut g.x)?;
+            (0..traces.len())
+                .map(|l| {
+                    g.launch_layer(l)?;
+                    Ok(g.stream.clone_dtoh(&g.x)?)
+                })
+                .collect()
+        };
+    let steps = chain(false, false, None)?;
+    let fused = chain(true, false, None)?;
+    // The layer kernel one phase per launch (for measurements): the same tasks.
+    let split = chain(true, true, None)?;
+    eprintln!(
+        "  layer   chained: vs julia-rs   vs the per-step kernels   one launch per phase, vs julia-rs"
+    );
+    let (mut worst_ref, mut worst_steps, mut worst_split) = (0f64, 0f64, 0f64);
+    for (l, (((x, s), p), t)) in fused.iter().zip(&steps).zip(&split).zip(traces).enumerate() {
+        let (r, d, q) = (
             rel_err(&to_f32(x), &t.x_out),
             rel_err(&to_f32(x), &to_f32(s)),
+            rel_err(&to_f32(p), &t.x_out),
         );
-        eprintln!("  {l:5}   {r:.2e}             {d:.2e}");
-        (worst_ref, worst_steps) = (worst_ref.max(r), worst_steps.max(d));
+        eprintln!("  {l:5}   {r:.2e}             {d:.2e}                  {q:.2e}");
+        (worst_ref, worst_steps, worst_split) =
+            (worst_ref.max(r), worst_steps.max(d), worst_split.max(q));
     }
     eprintln!(
         "  worst: each layer from julia-rs's stream {per_layer:.2e}; chained {worst_ref:.2e} vs \
-         julia-rs, {worst_steps:.2e} vs the per-step kernels"
+         julia-rs, {worst_steps:.2e} vs the per-step kernels; one launch per phase \
+         {worst_split:.2e} vs julia-rs"
     );
+    // Other plans: mixed tile heights, split-K in every GEMM, attention's key blocks in ranges
+    // (more ranges than blocks too, which leaves some empty), chained against julia-rs.
+    let plans = [
+        LayerPlan {
+            bm: [64, 32, 64, 32],
+            splits: [2, 3, 1, 4],
+            kv: [2, 3],
+        },
+        LayerPlan {
+            bm: [32, 64, 32, 64],
+            splits: [1, 2, 2, 1],
+            kv: [4, 2],
+        },
+        LayerPlan {
+            kv: [6, 1],
+            ..default
+        },
+    ];
+    let mut worst_plans = 0f64;
+    for plan in plans {
+        let x = chain(true, false, Some(plan))?;
+        let worst = (x.iter().zip(traces))
+            .map(|(x, t)| rel_err(&to_f32(x), &t.x_out))
+            .fold(0f64, f64::max);
+        eprintln!("  plan {plan}: chained, worst {worst:.2e} vs julia-rs");
+        worst_plans = worst_plans.max(worst);
+    }
+    (g.fused, g.split_phases, g.plan) = (false, false, None);
     // The same tasks as the per-step kernels; only the order of the row statistics' atomic
     // additions differs, so the two chains drift apart like any two runs.
     ensure!(
         per_layer < MAX_ERR.x_out
             && worst_ref < MAX_ERR_CHAINED.x_out
-            && worst_steps < MAX_ERR_CHAINED.x_out,
+            && worst_steps < MAX_ERR_CHAINED.x_out
+            && worst_split < MAX_ERR_CHAINED.x_out
+            && worst_plans < MAX_ERR_CHAINED.x_out,
         "the layer kernel is off"
     );
     Ok(())
