@@ -7,6 +7,7 @@ use cuda_device::vector::{F32x4, U16x4};
 use cuda_device::{kernel, thread};
 use cuda_host::cuda_module;
 
+mod attn;
 mod gemm;
 mod helpers;
 
@@ -179,6 +180,168 @@ mod kernels {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Attention (see attn.rs): o = softmax(q·kᵀ / √64) · v per head, keys limited to
+    // |i − j| <= window when window > 0 (the sliding-window layers). Grid (⌈n/64⌉, 6 heads),
+    // 128 threads.
+
+    #[kernel]
+    pub fn attention(qkv: *const u16, o: *mut u16, n: u32, window: u32) {
+        static mut QS: SharedArray<u16, { attn::BQ * attn::HD }, 128> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u16, { attn::BQ * attn::HD }, 128> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u16, { attn::BQ * attn::HD }, 128> = SharedArray::UNINIT;
+        let (qs, ks, vs) = (
+            core::ptr::addr_of_mut!(QS) as *mut u16,
+            core::ptr::addr_of_mut!(KS) as *mut u16,
+            core::ptr::addr_of_mut!(VS) as *mut u16,
+        );
+        let tid = thread::threadIdx_x();
+        let (lane, warp) = (tid & 31, tid >> 5);
+        let (q0, head) = (thread::blockIdx_x() * attn::BQ as u32, thread::blockIdx_y());
+
+        attn::load_tile(qkv, qs, n, q0, head, 0);
+        thread::sync_threads();
+        // This warp's 16 queries as A fragments, one per 16 dimensions.
+        let mut qf = [[0u32; 4]; 4];
+        #[unroll]
+        for ks_ in 0..4u32 {
+            qf[ks_ as usize] = gemm::ldsm_x4(attn::at(qs, attn::swz64(warp * 16 + (lane & 15), ks_ * 2 + (lane >> 4))));
+        }
+
+        // Key blocks: all, or those the window of any of this block's queries reaches.
+        let nb = n.div_ceil(attn::BQ as u32);
+        let (kb0, kb1) = if window == 0 {
+            (0, nb)
+        } else {
+            let lo = q0.saturating_sub(window) / attn::BQ as u32;
+            let hi = ((q0 + attn::BQ as u32 - 1 + window).min(n - 1)) / attn::BQ as u32 + 1;
+            (lo, hi)
+        };
+        // 1/√64 and log2(e), so the softmax is a bare exp2.
+        let scale = core::f32::consts::LOG2_E / 8.0;
+        let (g, t) = (lane >> 2, lane & 3);
+        let qrow = [q0 + warp * 16 + g, q0 + warp * 16 + g + 8];
+        let mut mx = [f32::NEG_INFINITY; 2];
+        let mut sum = [0f32; 2];
+        let mut acc = [[0f32; 4]; 8];
+
+        let mut kb = kb0;
+        while kb < kb1 {
+            let k0 = kb * attn::BQ as u32;
+            attn::load_tile(qkv, ks, n, k0, head, 1);
+            attn::load_tile(qkv, vs, n, k0, head, 2);
+            thread::sync_threads();
+
+            // S = Q·Kᵀ for this warp's 16 queries × 64 keys: 8 n8 tiles.
+            let mut s = [[0f32; 4]; 8];
+            let nrow = (lane & 7) + ((lane >> 4) << 3);
+            #[unroll]
+            for ks_ in 0..4u32 {
+                let kc = ks_ * 2 + ((lane >> 3) & 1);
+                #[unroll]
+                for jp in 0..4u32 {
+                    let b = gemm::ldsm_x4(attn::at(ks, attn::swz64(16 * jp + nrow, kc)));
+                    gemm::mma(&mut s[2 * jp as usize], &qf[ks_ as usize], b[0], b[1]);
+                    gemm::mma(&mut s[2 * jp as usize + 1], &qf[ks_ as usize], b[2], b[3]);
+                }
+            }
+
+            // Scale, mask (keys past n, outside the window), and the online softmax: each row's
+            // values sit in the 4 lanes of a quad (same g), elements 2h, 2h + 1 of every tile.
+            #[unroll]
+            for h in 0..2usize {
+                let mut m = f32::NEG_INFINITY;
+                #[unroll]
+                for jt in 0..8u32 {
+                    #[unroll]
+                    for e in 0..2usize {
+                        let key = k0 + 8 * jt + 2 * t + e as u32;
+                        let q = qrow[h];
+                        let near = window == 0 || (if q > key { q - key } else { key - q }) <= window;
+                        let v = &mut s[jt as usize][2 * h + e];
+                        *v = if key < n && near { *v * scale } else { f32::NEG_INFINITY };
+                        m = if *v > m { *v } else { m };
+                    }
+                }
+                // SAFETY: the whole warp runs this (no divergence in this kernel).
+                unsafe {
+                    let o1 = gemm::shfl_xor(m, 1);
+                    m = if o1 > m { o1 } else { m };
+                    let o2 = gemm::shfl_xor(m, 2);
+                    m = if o2 > m { o2 } else { m };
+                }
+                let m_new = if m > mx[h] { m } else { mx[h] };
+                // A row with no valid key yet keeps -inf; exp2(-inf - 0) = 0 then.
+                let base = if m_new == f32::NEG_INFINITY { 0.0 } else { m_new };
+                let alpha = attn_exp2(mx[h] - base);
+                mx[h] = m_new;
+                let mut rs = 0f32;
+                #[unroll]
+                for jt in 0..8usize {
+                    #[unroll]
+                    for e in 0..2usize {
+                        let p = attn_exp2(s[jt][2 * h + e] - base);
+                        s[jt][2 * h + e] = p;
+                        rs += p;
+                    }
+                    acc[jt][2 * h] *= alpha;
+                    acc[jt][2 * h + 1] *= alpha;
+                }
+                // Per-lane partial sums: alpha is the same across the quad, so they reduce at the end.
+                sum[h] = sum[h] * alpha + rs;
+            }
+
+            // O += P·V: P's accumulators for keys 16kk..16kk + 15 are the A fragment; V via
+            // ldmatrix.trans, two dimension tiles per load.
+            #[unroll]
+            for kk in 0..4usize {
+                let a = [
+                    gemm::pack(s[2 * kk][0], s[2 * kk][1]),
+                    gemm::pack(s[2 * kk][2], s[2 * kk][3]),
+                    gemm::pack(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                    gemm::pack(s[2 * kk + 1][2], s[2 * kk + 1][3]),
+                ];
+                #[unroll]
+                for dp in 0..4u32 {
+                    let v = attn::ldsm_x4_trans(attn::at(vs, attn::swz64(16 * kk as u32 + (lane & 15), 2 * dp + (lane >> 4))));
+                    gemm::mma(&mut acc[2 * dp as usize], &a, v[0], v[1]);
+                    gemm::mma(&mut acc[2 * dp as usize + 1], &a, v[2], v[3]);
+                }
+            }
+            thread::sync_threads();
+            kb += 1;
+        }
+
+        #[unroll]
+        for h in 0..2usize {
+            let mut l = sum[h];
+            // SAFETY: the whole warp is here.
+            unsafe {
+                l += gemm::shfl_xor(l, 1);
+                l += gemm::shfl_xor(l, 2);
+            }
+            let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+            if qrow[h] < n {
+                #[unroll]
+                for jt in 0..8u32 {
+                    let col = head * attn::HD as u32 + 8 * jt + 2 * t;
+                    let out = gemm::pack(acc[jt as usize][2 * h] * inv, acc[jt as usize][2 * h + 1] * inv);
+                    // SAFETY: qrow < n and col + 1 < D: inside o ([n, D]); 4-byte aligned (even
+                    // col); each (row, column pair) has one owner.
+                    unsafe { *(o.add(qrow[h] as usize * attn::D + col as usize) as *mut u32) = out };
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn attn_exp2(x: f32) -> f32 {
+        let r: f32;
+        // SAFETY: register-only.
+        unsafe { cuda_device::ptx_asm!("ex2.approx.ftz.f32 %0, %1;", out("=f") r, in("f") x) };
+        r
     }
 
     // -----------------------------------------------------------------------------------------

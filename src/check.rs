@@ -20,7 +20,7 @@ use julia_rs::{
 
 use crate::{
     D,
-    gemm::{self, Config, Epilogue, Gemm, GemmKernels, LnInputs},
+    gemm::{self, Config, Epilogue, Gemm, LnInputs},
     weights::{GpuWeights, HostWeights},
 };
 
@@ -296,25 +296,31 @@ fn stats_err(x: &[f16], stats: &[f32], k: usize) -> f64 {
 }
 
 /// One encoder layer's four GEMMs on a residual stream the implementation keeps (on the GPU, or
-/// emulated on the host). Attention isn't on the GPU yet, so its output comes from julia-rs.
-pub trait LayerGemms {
+/// One encoder layer on a residual stream the implementation keeps (on the GPU, or emulated on
+/// the host): the four GEMMs and attention.
+pub trait EncoderSteps {
     /// Replaces the stream with `x` (and the row statistics the next qkv reads with its own).
     fn set_stream(&mut self, x: &[f16]) -> color_eyre::Result<()>;
     /// The stream's qkv for layer `l` (LayerNorm folded in from layer 1, RoPE applied), q and k
     /// in the permuted order.
     fn qkv(&mut self, l: usize) -> color_eyre::Result<Vec<f16>>;
-    /// stream += o · Woᵀ; returns the stream and its row statistics.
-    fn wo(&mut self, l: usize, o: &[f16]) -> color_eyre::Result<(Vec<f16>, Vec<f32>)>;
+    /// Attention over the last qkv (global or sliding-window as layer `l` is).
+    fn attention(&mut self, l: usize) -> color_eyre::Result<Vec<f16>>;
+    /// stream += o · Woᵀ, with `o` given or (`None`) from `attention`; returns the stream and its
+    /// row statistics.
+    fn wo(&mut self, l: usize, o: Option<&[f16]>) -> color_eyre::Result<(Vec<f16>, Vec<f32>)>;
     /// m = GeGLU(LN(stream) · Wiᵀ).
     fn wi(&mut self, l: usize) -> color_eyre::Result<Vec<f16>>;
     /// stream += m · Wo_mlpᵀ; returns the stream and its row statistics.
     fn wo_mlp(&mut self, l: usize) -> color_eyre::Result<(Vec<f16>, Vec<f32>)>;
 }
 
-/// Relative errors of one layer's GEMMs against julia-rs.
+/// Relative errors of one layer's steps against julia-rs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LayerErrors {
     pub qkv: f64,
+    /// The attention output (0 when julia-rs's is used).
+    pub o: f64,
     pub x_mid: f64,
     pub m: f64,
     pub x_out: f64,
@@ -326,6 +332,7 @@ impl LayerErrors {
     fn max(self, o: Self) -> Self {
         Self {
             qkv: self.qkv.max(o.qkv),
+            o: self.o.max(o.o),
             x_mid: self.x_mid.max(o.x_mid),
             m: self.m.max(o.m),
             x_out: self.x_out.max(o.x_out),
@@ -338,20 +345,32 @@ impl std::fmt::Display for LayerErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "qkv {:.2e}, x+o·Wo {:.2e}, m {:.2e}, x+m·Wo2 {:.2e}, stats {:.1e}",
-            self.qkv, self.x_mid, self.m, self.x_out, self.stats
+            "qkv {:.2e}, o {:.2e}, x+o·Wo {:.2e}, m {:.2e}, x+m·Wo2 {:.2e}, stats {:.1e}",
+            self.qkv, self.o, self.x_mid, self.m, self.x_out, self.stats
         )
     }
 }
 
-/// Layer `l`'s four GEMMs, from whatever stream `g` holds, against `t`.
-pub fn layer(g: &mut impl LayerGemms, l: usize, t: &LayerTrace) -> color_eyre::Result<LayerErrors> {
+/// Layer `l`, from whatever stream `g` holds, against `t`; attention from `g` if
+/// `own_attention`, else julia-rs's.
+pub fn layer(
+    g: &mut impl EncoderSteps,
+    l: usize,
+    t: &LayerTrace,
+    own_attention: bool,
+) -> color_eyre::Result<LayerErrors> {
     let qkv = g.qkv(l)?;
-    let (x_mid, s1) = g.wo(l, &to_f16(&t.o))?;
+    let (o_err, (x_mid, s1)) = if own_attention {
+        let o = g.attention(l)?;
+        (rel_err(&to_f32(&o), &t.o), g.wo(l, None)?)
+    } else {
+        (0.0, g.wo(l, Some(&to_f16(&t.o)))?)
+    };
     let m = g.wi(l)?;
     let (x_out, s2) = g.wo_mlp(l)?;
     Ok(LayerErrors {
         qkv: rel_err(&to_f32(&unpermute_rope(&qkv)), &t.qkv),
+        o: o_err,
         x_mid: rel_err(&to_f32(&x_mid), &t.x_mid),
         m: rel_err(&to_f32(&m), &t.m),
         x_out: rel_err(&to_f32(&x_out), &t.x_out),
@@ -359,11 +378,13 @@ pub fn layer(g: &mut impl LayerGemms, l: usize, t: &LayerTrace) -> color_eyre::R
     })
 }
 
-/// Limits for each layer's GEMMs run from julia-rs's stream: about 3× what the host emulation
-/// of the kernels' arithmetic reaches (≤ 6e-4, see the test), so a correct kernel passes and an
-/// indexing bug (errors of order 1) can't.
+/// Limits for a layer run from julia-rs's stream: about 3× what the host emulation of the
+/// kernels' arithmetic reaches (≤ 6e-4 for the GEMMs, see the test), so a correct kernel passes
+/// and an indexing bug (errors of order 1) can't. Attention's P is rounded to f16 for the P·V
+/// product (as in FlashAttention), so its output is a little further off.
 const MAX_ERR: LayerErrors = LayerErrors {
     qkv: 2e-3,
+    o: 4e-3,
     x_mid: 2e-3,
     m: 2e-3,
     x_out: 2e-3,
@@ -373,9 +394,10 @@ const MAX_ERR: LayerErrors = LayerErrors {
 /// Limits for the chain through all layers: f16's differences add up in the residual stream and
 /// get amplified by Julia's massive activations (the emulation reaches 8e-3 in layer 18's GeGLU,
 /// whose largest values are ~2000 against an rms of 12). Loose: this checks the data flow
-/// between the GEMMs (statistics, clearing, the in-place residual), not precision.
+/// between the steps (statistics, clearing, the in-place residual), not precision.
 const MAX_ERR_CHAINED: LayerErrors = LayerErrors {
     qkv: 3e-2,
+    o: 3e-2,
     x_mid: 3e-2,
     m: 3e-2,
     x_out: 3e-2,
@@ -384,57 +406,84 @@ const MAX_ERR_CHAINED: LayerErrors = LayerErrors {
 
 fn within(e: LayerErrors, max: LayerErrors) -> bool {
     e.qkv < max.qkv
+        && e.o < max.o
         && e.x_mid < max.x_mid
         && e.m < max.m
         && e.x_out < max.x_out
         && e.stats < max.stats
 }
 
-/// All layers, with julia-rs's attention outputs. `chained`: each layer on the stream the
-/// previous layer left, as the forward pass will run them (starting from whatever `g` holds);
-/// otherwise each layer from julia-rs's stream entering it. Prints a row per layer.
+/// How `layers` runs the layers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Each layer from julia-rs's stream entering it, with julia-rs's attention output: the
+    /// GEMMs alone.
+    Gemms,
+    /// Each layer from julia-rs's stream, attention included.
+    Layers,
+    /// Each layer on the stream the previous one left, from whatever `g` holds (embed's
+    /// output): the encoder as the forward pass runs it.
+    Encoder,
+}
+
+/// All layers in `mode`, against julia-rs. Prints a row per layer (or, `rows` false, only the
+/// worst).
 pub fn layers(
-    g: &mut impl LayerGemms,
+    g: &mut impl EncoderSteps,
     traces: &[LayerTrace],
-    chained: bool,
+    mode: Mode,
+    rows: bool,
 ) -> color_eyre::Result<LayerErrors> {
-    let how = match chained {
-        true => "chained from embed's output",
-        false => "each from julia-rs's stream",
+    let how = match mode {
+        Mode::Gemms => "the GEMMs, each layer from julia-rs's stream and attention output",
+        Mode::Layers => "each layer from julia-rs's stream, attention on the GPU",
+        Mode::Encoder => "the encoder, chained from embed's output",
     };
+    let n = traces.first().map_or(0, |t| t.x_in.len() / D);
     eprintln!(
-        "layer GEMMs vs julia-rs, {how} (relative error; stats: resstats row sums vs Σ of the output)"
+        "{how}, {n} tokens (relative error vs julia-rs; stats: resstats row sums vs Σ of the output)"
     );
-    eprintln!("  layer     qkv     x+o·Wo   GeGLU m  x+m·Wo2  stats");
+    if rows {
+        eprintln!("  layer     qkv      attn o   x+o·Wo   GeGLU m  x+m·Wo2  stats");
+    }
     let mut worst = LayerErrors::default();
     for (l, t) in traces.iter().enumerate() {
-        if !chained {
+        if mode != Mode::Encoder {
             g.set_stream(&to_f16(&t.x_in))?;
         }
-        let e = layer(g, l, t)?;
-        eprintln!(
-            "  {l:5}  {:.2e}  {:.2e}  {:.2e}  {:.2e}  {:.1e}",
-            e.qkv, e.x_mid, e.m, e.x_out, e.stats
-        );
+        let e = layer(g, l, t, mode != Mode::Gemms)?;
+        if rows {
+            eprintln!(
+                "  {l:5}  {:.2e}  {:.2e}  {:.2e}  {:.2e}  {:.2e}  {:.1e}",
+                e.qkv, e.o, e.x_mid, e.m, e.x_out, e.stats
+            );
+        }
         worst = worst.max(e);
     }
-    let max = if chained { MAX_ERR_CHAINED } else { MAX_ERR };
+    eprintln!("  worst: {worst}");
+    let max = if mode == Mode::Encoder {
+        MAX_ERR_CHAINED
+    } else {
+        MAX_ERR
+    };
     ensure!(
         within(worst, max),
-        "a layer GEMM is off julia-rs: worst {worst}; limits {max}"
+        "a layer is off julia-rs: worst {worst}; limits {max}"
     );
     Ok(worst)
 }
 
-/// The GEMMs on the GPU, with the forward pass's buffers: the stream `x`, and the two
+/// The encoder layers on the GPU, with the forward pass's buffers: the stream `x`, and the two
 /// statistics buffers in turn (wo writes `stats_attn` for wi, wo_mlp `stats_mlp` for the next
 /// qkv; each is cleared by the GEMM before its writer: qkv clears `stats_attn`, wi `stats_mlp`).
-pub struct GpuGemms<'a> {
+pub struct GpuEncoder<'a> {
     stream: &'a Arc<CudaStream>,
-    kernels: &'a GemmKernels,
+    kernels: &'a crate::Kernels,
     scratch: &'a gemm::Scratch,
     w: &'a GpuWeights,
     eps: f32,
+    /// The sliding-window layers' reach: keys with |i − j| <= window.
+    window: usize,
     /// Overrides `gemm::choose` for every GEMM (for sweeps).
     pub config: Option<Config>,
     sms: usize,
@@ -446,14 +495,15 @@ pub struct GpuGemms<'a> {
     stats_mlp: CudaSlice<f32>,
 }
 
-impl<'a> GpuGemms<'a> {
+impl<'a> GpuEncoder<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream: &'a Arc<CudaStream>,
-        kernels: &'a GemmKernels,
+        kernels: &'a crate::Kernels,
         scratch: &'a gemm::Scratch,
         w: &'a GpuWeights,
         eps: f32,
+        window: usize,
         sms: usize,
         x: CudaSlice<f16>,
         inter: usize,
@@ -465,6 +515,7 @@ impl<'a> GpuGemms<'a> {
             scratch,
             w,
             eps,
+            window,
             config: None,
             sms,
             qkv: stream.alloc_zeros(n * 3 * D)?,
@@ -515,7 +566,32 @@ impl<'a> GpuGemms<'a> {
             stats_out: None,
             zero: Some(&mut self.stats_attn),
         };
-        gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
+        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
+    }
+
+    /// Queues layer `l`'s attention (qkv → o).
+    pub fn launch_attention(&mut self, l: usize) -> color_eyre::Result<()> {
+        let window = if self.w.layout.layers[l].global {
+            0
+        } else {
+            self.window
+        };
+        crate::attn::launch(
+            self.stream,
+            &self.kernels.attention,
+            &self.qkv,
+            &mut self.o,
+            window,
+        )
+    }
+
+    /// Queues all of layer `l`: qkv, attention, wo, wi, wo_mlp.
+    pub fn launch_layer(&mut self, l: usize) -> color_eyre::Result<()> {
+        self.launch_qkv(l)?;
+        self.launch_attention(l)?;
+        self.launch_wo(l)?;
+        self.launch_wi(l)?;
+        self.launch_wo_mlp(l)
     }
 
     /// Queues layer `l`'s Wo GEMM (stream += o · Woᵀ).
@@ -533,7 +609,7 @@ impl<'a> GpuGemms<'a> {
             zero: None,
             rope: None,
         };
-        gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
+        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
     }
 
     /// Queues layer `l`'s Wi GEMM (m = GeGLU(LN(stream) · Wiᵀ)).
@@ -558,7 +634,7 @@ impl<'a> GpuGemms<'a> {
             zero: Some(&mut self.stats_mlp),
             rope: None,
         };
-        gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
+        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
     }
 
     /// Queues layer `l`'s Wo_mlp GEMM (stream += m · Wo_mlpᵀ).
@@ -577,11 +653,11 @@ impl<'a> GpuGemms<'a> {
             zero: None,
             rope: None,
         };
-        gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
+        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
     }
 }
 
-impl LayerGemms for GpuGemms<'_> {
+impl EncoderSteps for GpuEncoder<'_> {
     fn set_stream(&mut self, x: &[f16]) -> color_eyre::Result<()> {
         self.stream.memcpy_htod(x, &mut self.x)?;
         self.stream
@@ -594,8 +670,15 @@ impl LayerGemms for GpuGemms<'_> {
         Ok(self.stream.clone_dtoh(&self.qkv)?)
     }
 
-    fn wo(&mut self, l: usize, o: &[f16]) -> color_eyre::Result<(Vec<f16>, Vec<f32>)> {
-        self.stream.memcpy_htod(o, &mut self.o)?;
+    fn attention(&mut self, l: usize) -> color_eyre::Result<Vec<f16>> {
+        self.launch_attention(l)?;
+        Ok(self.stream.clone_dtoh(&self.o)?)
+    }
+
+    fn wo(&mut self, l: usize, o: Option<&[f16]>) -> color_eyre::Result<(Vec<f16>, Vec<f32>)> {
+        if let Some(o) = o {
+            self.stream.memcpy_htod(o, &mut self.o)?;
+        }
         self.launch_wo(l)?;
         Ok((
             self.stream.clone_dtoh(&self.x)?,
@@ -620,13 +703,13 @@ impl LayerGemms for GpuGemms<'_> {
 /// Every configuration (shape × split-K) on one layer's GEMMs, each from julia-rs's stream
 /// entering that layer: shape- and split-specific bugs show here, while `layers` runs only the
 /// chosen configurations.
-pub fn sweep(g: &mut GpuGemms, l: usize, t: &LayerTrace) -> color_eyre::Result<()> {
+pub fn sweep(g: &mut GpuEncoder, l: usize, t: &LayerTrace) -> color_eyre::Result<()> {
     eprintln!("every GEMM configuration on layer {l}:");
     let mut bad = vec![];
     for cfg in gemm::configs() {
         g.config = Some(cfg);
         g.set_stream(&to_f16(&t.x_in))?;
-        let e = layer(g, l, t)?;
+        let e = layer(g, l, t, false)?;
         eprintln!(
             "  {:<18} qkv {:.2e}  x+o·Wo {:.2e}  m {:.2e}  x+m·Wo2 {:.2e}  stats {:.1e}",
             cfg.to_string(),
@@ -730,11 +813,15 @@ mod tests {
 /// products summed in f64 (the GPU sums in f32), the epilogues as the kernels compute them,
 /// including the GeGLU interleave.
 #[cfg(test)]
-struct HostGemms<'a> {
+struct HostEncoder<'a> {
     host: &'a HostWeights,
     eps: f32,
     inter: usize,
+    /// The sliding-window layers' reach.
+    window: usize,
     x: Vec<f16>,
+    qkv: Vec<f16>,
+    o: Vec<f16>,
     m: Vec<f16>,
     stats_attn: Vec<f32>,
     stats_mlp: Vec<f32>,
@@ -742,10 +829,12 @@ struct HostGemms<'a> {
     naive_geglu: bool,
     /// Leaves RoPE out: another.
     no_rope: bool,
+    /// Lets every layer attend to all keys: another.
+    no_window: bool,
 }
 
 #[cfg(test)]
-impl HostGemms<'_> {
+impl HostEncoder<'_> {
     /// `a · wᵀ` with `a` `[m, k]` and `w` `[n, k]`.
     fn matmul(a: &[f16], w: &[f16], k: usize) -> Vec<f32> {
         let w: Vec<f32> = to_f32(w);
@@ -801,7 +890,7 @@ impl HostGemms<'_> {
 }
 
 #[cfg(test)]
-impl LayerGemms for HostGemms<'_> {
+impl EncoderSteps for HostEncoder<'_> {
     fn set_stream(&mut self, x: &[f16]) -> color_eyre::Result<()> {
         self.x = x.to_vec();
         self.stats_mlp = row_stats(x, D);
@@ -834,11 +923,51 @@ impl LayerGemms for HostGemms<'_> {
             }
         }
         self.stats_attn.fill(0.0);
-        Ok(to_f16(&acc))
+        self.qkv = to_f16(&acc);
+        Ok(self.qkv.clone())
     }
 
-    fn wo(&mut self, l: usize, o: &[f16]) -> color_eyre::Result<(Vec<f16>, Vec<f32>)> {
-        let acc = Self::matmul(o, &self.host.f16[self.host.layout.layers[l].wo.range()], D);
+    /// Softmax in f32 from f16 q, k (the dot products don't see the RoPE permutation), P rounded
+    /// to f16 for P·V as the kernel does, f32 sums.
+    fn attention(&mut self, l: usize) -> color_eyre::Result<Vec<f16>> {
+        let n = self.qkv.len() / (3 * D);
+        let global = self.no_window || self.host.layout.layers[l].global;
+        let row = |i: usize| &self.qkv[i * 3 * D..][..3 * D];
+        let mut o = vec![f16::ZERO; n * D];
+        for h in 0..D / 64 {
+            for i in 0..n {
+                let q = to_f32(&row(i)[h * 64..][..64]);
+                let keys: Vec<usize> = (0..n)
+                    .filter(|&j| global || i.abs_diff(j) <= self.window)
+                    .collect();
+                let s: Vec<f32> = (keys.iter())
+                    .map(|&j| {
+                        let k = &row(j)[D + h * 64..][..64];
+                        q.iter().zip(k).map(|(a, b)| a * b.to_f32()).sum::<f32>() / 8.0
+                    })
+                    .collect();
+                let mx = s.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let p: Vec<f32> = s.iter().map(|&v| (v - mx).exp()).collect();
+                let sum: f32 = p.iter().sum();
+                let mut acc = [0f32; 64];
+                for (&j, &p) in keys.iter().zip(&p) {
+                    let p = f16::from_f32(p).to_f32();
+                    for (a, v) in acc.iter_mut().zip(&row(j)[2 * D + h * 64..][..64]) {
+                        *a += p * v.to_f32();
+                    }
+                }
+                for (dst, a) in o[i * D + h * 64..][..64].iter_mut().zip(acc) {
+                    *dst = f16::from_f32(a / sum);
+                }
+            }
+        }
+        self.o = o.clone();
+        Ok(o)
+    }
+
+    fn wo(&mut self, l: usize, o: Option<&[f16]>) -> color_eyre::Result<(Vec<f16>, Vec<f32>)> {
+        let o = o.map_or_else(|| self.o.clone(), <[f16]>::to_vec);
+        let acc = Self::matmul(&o, &self.host.f16[self.host.layout.layers[l].wo.range()], D);
         let (x, s) = self.residual(&acc);
         self.stats_attn.copy_from_slice(&s);
         Ok((x, s))
@@ -892,8 +1021,9 @@ mod layer_tests {
     use super::*;
     use crate::checkpoint::Checkpoint;
 
-    /// The layer check on the host emulation of the kernels: it must pass (this is where
-    /// the limits' margins come from), and a GeGLU read in the wrong order or a missing RoPE must fail.
+    /// The layer checks on the host emulation of the kernels: they must pass (this is where the
+    /// limits' margins come from), and a GeGLU read in the wrong order, a missing RoPE or a
+    /// missing attention window must fail.
     #[test]
     fn layer_check_passes_the_emulation() {
         let dir = std::env::var_os("JULIA_MODEL")
@@ -916,28 +1046,68 @@ mod layer_tests {
             DEFAULT_HEAD_LENGTH,
         )
         .unwrap();
-        let n = seq.ids.len();
-        let traces = trace(&model, &seq.ids);
-        let gemms = |naive_geglu, no_rope| HostGemms {
+        let encoder = |ids: &[u32], bugs: [bool; 3]| HostEncoder {
             host: &host,
             eps: c.norm_eps,
             inter: c.intermediate,
-            x: emulate_embed(&host, &seq.ids, c.norm_eps),
+            window: c.local_window / 2,
+            x: emulate_embed(&host, ids, c.norm_eps),
+            qkv: vec![],
+            o: vec![],
             m: vec![],
-            stats_attn: vec![0.0; 2 * n],
-            stats_mlp: vec![0.0; 2 * n],
-            naive_geglu,
-            no_rope,
+            stats_attn: vec![0.0; 2 * ids.len()],
+            stats_mlp: vec![0.0; 2 * ids.len()],
+            naive_geglu: bugs[0],
+            no_rope: bugs[1],
+            no_window: bugs[2],
         };
-        let worst = layers(&mut gemms(false, false), &traces, false).unwrap();
-        eprintln!("worst, per layer: {worst}");
-        let worst = layers(&mut gemms(false, false), &traces, true).unwrap();
-        eprintln!("worst, chained: {worst}");
-        let e = layer(&mut gemms(true, false), 0, &traces[0]).unwrap();
+        let ok = [false; 3];
+        let traces = trace(&model, &seq.ids);
+        for mode in [Mode::Gemms, Mode::Layers, Mode::Encoder] {
+            layers(&mut encoder(&seq.ids, ok), &traces, mode, false).unwrap();
+        }
+        let e = layer(
+            &mut encoder(&seq.ids, [true, false, false]),
+            0,
+            &traces[0],
+            false,
+        )
+        .unwrap();
         eprintln!("naive GeGLU order, layer 0: {e}");
         assert!(!within(e, MAX_ERR_CHAINED));
-        let e = layer(&mut gemms(false, true), 0, &traces[0]).unwrap();
+        let e = layer(
+            &mut encoder(&seq.ids, [false, true, false]),
+            0,
+            &traces[0],
+            false,
+        )
+        .unwrap();
         eprintln!("no RoPE, layer 0: {e}");
         assert!(!within(e, MAX_ERR_CHAINED));
+
+        // The window, on a request long enough for it to matter: layer 0 is global, layer 1
+        // sliding-window.
+        let long = sequence(
+            &ck.tokenizer,
+            &crate::long_request(),
+            c.max_positions,
+            DEFAULT_HEAD_LENGTH,
+        )
+        .unwrap();
+        let traces = trace(&model, &long.ids);
+        assert!(host.layout.layers[0].global && !host.layout.layers[1].global);
+        eprintln!("{} tokens:", long.ids.len());
+        for (l, t) in traces[..2].iter().enumerate() {
+            let mut g = encoder(&long.ids, ok);
+            g.set_stream(&to_f16(&t.x_in)).unwrap();
+            let e = layer(&mut g, l, t, true).unwrap();
+            eprintln!("  layer {l}: {e}");
+            assert!(within(e, MAX_ERR));
+        }
+        let mut g = encoder(&long.ids, [false, false, true]);
+        g.set_stream(&to_f16(&traces[1].x_in)).unwrap();
+        let e = layer(&mut g, 1, &traces[1], true).unwrap();
+        eprintln!("  no window, layer 1: {e}");
+        assert!(!within(e, MAX_ERR));
     }
 }

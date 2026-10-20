@@ -9,6 +9,7 @@ use cudarc::{
     nvrtc::Ptx,
 };
 
+mod attn;
 mod check;
 mod checkpoint;
 mod gemm;
@@ -93,6 +94,7 @@ pub struct Kernels {
     gemm_tiled: CudaFunction,
     /// The tensor-core GEMMs.
     gemm: gemm::GemmKernels,
+    attention: CudaFunction,
 }
 
 /// Loads the embedded PTX, after checking that this GPU can run its tier. The driver
@@ -126,6 +128,7 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
         embed: module.load_function("embed")?,
         gemm_tiled: module.load_function("gemm_tiled")?,
         gemm: gemm::GemmKernels::load(&module)?,
+        attention: module.load_function("attention")?,
     })
 }
 
@@ -266,6 +269,24 @@ pub fn gemm_tiled_into(
     Ok(())
 }
 
+/// A request of 363 tokens, long enough that the sliding window (64 keys each side) leaves out
+/// most of a local layer's keys (each query sees at most 129): the window check needs it.
+fn long_request() -> Request<'static> {
+    let state = (0..10)
+        .map(|i| {
+            format!(
+                "Note {i}: the customer was charged twice for the same subscription renewal, once \
+                 on the card on file and once on a gift card that should have been used up."
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Request {
+        state: state.into(),
+        ..sample_request()
+    }
+}
+
 /// The request the kernels run on until requests come from stdin.
 fn sample_request() -> Request<'static> {
     Request {
@@ -359,17 +380,32 @@ fn main() -> color_eyre::Result<()> {
 
     let n = seq.ids.len();
     let sms = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
-    let scratch = gemm::Scratch::new(&stream, n)?;
-    let mut layers = check::GpuGemms::new(
-        &stream,
-        &kernels.gemm,
-        &scratch,
-        &gpu,
-        c.norm_eps,
-        sms,
-        stream.clone_dtod(&x)?,
-        c.intermediate,
+    // The long request's (for checking the attention window, and timing at 363 tokens).
+    let long = sequence(
+        &ck.tokenizer,
+        &long_request(),
+        c.max_positions,
+        DEFAULT_HEAD_LENGTH,
     )?;
+    let long_ids = stream.clone_htod(&long.ids)?;
+    let x_long = embed(&stream, &kernels, &gpu, &long_ids, c.norm_eps)?;
+    let scratch = gemm::Scratch::new(&stream, n.max(long.ids.len()))?;
+    let window = c.local_window / 2;
+    let encoder = |x: &CudaSlice<half::f16>| {
+        check::GpuEncoder::new(
+            &stream,
+            &kernels,
+            &scratch,
+            &gpu,
+            c.norm_eps,
+            window,
+            sms,
+            stream.clone_dtod(x)?,
+            c.intermediate,
+        )
+    };
+    let mut layers = encoder(&x)?;
+    let mut layers_long = encoder(&x_long)?;
     let inter = c.intermediate;
     let shapes = [
         ("qkv", 3 * D, D),
@@ -391,12 +427,19 @@ fn main() -> color_eyre::Result<()> {
         check::embed(&model, &host, &seq.ids, c.norm_eps, &x)?;
         check::qkv0(&model, &host, &seq.ids, &x, &stream.clone_dtoh(&qkv)?)?;
         let traces = check::trace(&model, &seq.ids);
-        // Each layer from julia-rs's stream, then from embed's output through all 22 (with
-        // julia-rs's attention outputs both times).
-        check::layers(&mut layers, &traces, false)?;
+        use check::Mode;
+        // The GEMMs alone, then with attention, each layer from julia-rs's stream; then the whole
+        // encoder from embed's output.
+        check::layers(&mut layers, &traces, Mode::Gemms, true)?;
+        check::layers(&mut layers, &traces, Mode::Layers, true)?;
         stream.memcpy_htod(&x, &mut layers.x)?;
-        check::layers(&mut layers, &traces, true)?;
+        check::layers(&mut layers, &traces, Mode::Encoder, true)?;
         check::sweep(&mut layers, 1, &traces[1])?;
+        // The long request, where the sliding window leaves out most keys.
+        let traces = check::trace(&model, &long.ids);
+        check::layers(&mut layers_long, &traces, Mode::Layers, false)?;
+        stream.memcpy_htod(&stream.clone_dtoh(&x_long)?, &mut layers_long.x)?;
+        check::layers(&mut layers_long, &traces, Mode::Encoder, false)?;
     }
 
     if time {
@@ -442,7 +485,7 @@ fn main() -> color_eyre::Result<()> {
         let mut layer_total = 0.0;
         for (gi, &(name, nn, k)) in shapes.iter().enumerate() {
             let flop = 2.0 * (n * nn * k) as f64;
-            let launch = |g: &mut check::GpuGemms, l: usize| match gi {
+            let launch = |g: &mut check::GpuEncoder, l: usize| match gi {
                 0 => g.launch_qkv(l),
                 1 => g.launch_wo(l),
                 2 => g.launch_wi(l),
@@ -483,11 +526,37 @@ fn main() -> color_eyre::Result<()> {
                 flop / t.median_us / 1e6
             );
         }
+        let n_layers = gpu.layout.layers.len();
         eprintln!(
-            "  one layer's four GEMMs: {layer_total:.1} µs; × {} layers: {:.2} ms",
-            gpu.layout.layers.len(),
-            layer_total * gpu.layout.layers.len() as f64 / 1e3
+            "  one layer's four GEMMs: {layer_total:.1} µs; × {n_layers} layers: {:.2} ms",
+            layer_total * n_layers as f64 / 1e3
         );
+
+        // Attention (layer 0 is global, layer 1 sliding-window), and the whole encoder (22 ×
+        // qkv, attention, wo, wi, wo_mlp: 110 launches), for both requests.
+        for (g, tokens) in [(&mut layers, n), (&mut layers_long, long.ids.len())] {
+            for l in [0, 1] {
+                let kind = if gpu.layout.layers[l].global {
+                    "global"
+                } else {
+                    "sliding-window"
+                };
+                let t = run(&mut || g.launch_attention(l))?;
+                eprintln!(
+                    "  attention, {kind}, {tokens} tokens: {:.2} / {:.2} µs",
+                    t.min_us, t.median_us
+                );
+            }
+            let t = timing::time(&stream, 2, 10, 5, &mut || {
+                (0..n_layers).try_for_each(|l| g.launch_layer(l))
+            })?;
+            eprintln!(
+                "  encoder ({n_layers} layers, {} launches), {tokens} tokens: {:.3} ms (fastest {:.3})",
+                5 * n_layers,
+                t.median_us / 1e3,
+                t.min_us / 1e3
+            );
+        }
     }
     Ok(())
 }
