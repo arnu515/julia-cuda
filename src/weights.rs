@@ -11,7 +11,7 @@ use half::{f16, slice::HalfFloatSliceExt};
 
 use crate::{
     checkpoint::Checkpoint,
-    prep::{fold_layernorm, interleave_geglu},
+    prep::{fold_layernorm, interleave_geglu, permute_rope, rope_table},
 };
 
 /// Every span starts at a multiple of this many bytes: 16-byte vector loads and `ldmatrix` need
@@ -43,9 +43,11 @@ impl<T> Span<T> {
 /// One encoder layer's weights, matrices `[out, in]` as in the checkpoint.
 #[derive(Clone, Debug)]
 pub struct EncoderLayer {
-    /// The attention LayerNorm's γ is folded in, except in layer 0, which has none.
+    /// The attention LayerNorm's γ is folded in, except in layer 0, which has none; q and k rows
+    /// permuted for RoPE (`prep::permute_rope`).
     pub wqkv: Span<f16>,
-    /// `colsum` for the folded `wqkv`; `None` in layer 0, whose qkv GEMM uses the plain epilogue.
+    /// `colsum` for the folded `wqkv`, in the same order; `None` in layer 0, which has no
+    /// LayerNorm to fold.
     pub qkv_colsum: Option<Span<f32>>,
     pub wo: Span<f16>,
     /// The MLP LayerNorm's γ folded in, rows interleaved for GeGLU (`prep::interleave_geglu`).
@@ -89,6 +91,10 @@ pub struct Scorer {
 pub struct Layout {
     pub tok_embeddings: Span<f16>,
     pub emb_norm: Span<f32>,
+    /// RoPE (cos, sin) tables for the global and the sliding-window layers
+    /// (`prep::rope_table`, up to `max_positions`).
+    pub rope_global: Span<f32>,
+    pub rope_local: Span<f32>,
     pub layers: Vec<EncoderLayer>,
     pub final_norm: Span<f32>,
     /// `[N_QTYPES, D]`, added to every row of the head's input.
@@ -139,22 +145,25 @@ impl HostWeights {
         let enc = &t.encoder;
         let tok_embeddings = h.push_f32(ck.f32(&enc.tok_embeddings));
         let emb_norm = f.push(ck.f32(&enc.emb_norm));
+        let c = &ck.config;
+        let rope_global = f.push(&rope_table(c.rope_theta_global, c.max_positions));
+        let rope_local = f.push(&rope_table(c.rope_theta_local, c.max_positions));
         let layers = (enc.layers.iter())
             .map(|l| {
-                // RoPE: permute the q and k rows here. Until then wqkv stays in
-                // checkpoint order.
+                // Folded (from layer 1), then q and k rows permuted for the RoPE epilogue.
                 let wqkv = ck.f32(&l.wqkv);
+                let k = ck.config.hidden;
                 let (wqkv, qkv_colsum) = match &l.attn_norm {
                     Some(gamma) => {
                         let folded = fold_layernorm(wqkv, ck.f32(gamma));
-                        (h.push(&folded.w), Some(f.push(&folded.colsum)))
+                        let colsum = permute_rope(&folded.colsum, 1);
+                        (h.push(&permute_rope(&folded.w, k)), Some(f.push(&colsum)))
                     }
-                    None => (h.push_f32(wqkv), None),
+                    None => (h.push_f32(&permute_rope(wqkv, k)), None),
                 };
                 // Folded, then its rows (and their column sums) interleaved for the GEMM's
                 // GeGLU epilogue.
                 let wi = fold_layernorm(ck.f32(&l.wi), ck.f32(&l.mlp_norm));
-                let k = ck.config.hidden;
                 EncoderLayer {
                     wqkv,
                     qkv_colsum,
@@ -197,6 +206,8 @@ impl HostWeights {
             layout: Layout {
                 tok_embeddings,
                 emb_norm,
+                rope_global,
+                rope_local,
                 layers,
                 final_norm,
                 type_emb,
@@ -285,22 +296,24 @@ mod tests {
         let emb = ck.f32(&t.encoder.tok_embeddings);
         assert_eq!(h(l.tok_embeddings), f16_of(emb));
         assert_eq!(f(l.emb_norm), ck.f32(&t.encoder.emb_norm));
-        // Layer 0's wqkv is only converted; the others are folded.
+        // Layer 0's wqkv is only converted (and permuted); the others are folded.
+        let k = ck.config.hidden;
         assert!(l.layers[0].qkv_colsum.is_none());
         assert_eq!(
             h(l.layers[0].wqkv),
-            f16_of(ck.f32(&t.encoder.layers[0].wqkv))
+            f16_of(&permute_rope(ck.f32(&t.encoder.layers[0].wqkv), k))
         );
         for i in [1, 21] {
             let (src, dst) = (&t.encoder.layers[i], &l.layers[i]);
             let qkv = fold_layernorm(ck.f32(&src.wqkv), ck.f32(src.attn_norm.as_ref().unwrap()));
             assert_eq!(
                 h(dst.wqkv),
-                qkv.w.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                (permute_rope(&qkv.w, k).iter())
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
             );
-            assert_eq!(f(dst.qkv_colsum.unwrap()), qkv.colsum);
+            assert_eq!(f(dst.qkv_colsum.unwrap()), permute_rope(&qkv.colsum, 1));
             let wi = fold_layernorm(ck.f32(&src.wi), ck.f32(&src.mlp_norm));
-            let k = ck.config.hidden;
             assert_eq!(f(dst.wi_colsum), interleave_geglu(&wi.colsum, 1));
             assert_eq!(
                 h(dst.wi),

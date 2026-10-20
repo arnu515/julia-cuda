@@ -184,11 +184,15 @@ mod kernels {
     // -----------------------------------------------------------------------------------------
     // The tensor-core GEMM (see gemm.rs), with fused epilogues:
     //
-    // - plain:    c = a · wᵀ.
-    // - ln:       c = LayerNorm(a) · wᵀ, with γ folded into w and colsum[j] = Σₖ w[j, k]:
+    // - rope:     c = a · wᵀ, then RoPE on the q and k thirds of c (qkv): the weights' q and k
+    //             rows are permuted (weights::permute_rope) so that each head's output columns
+    //             2i and 2i + 1, which a thread holds as a pair, are its dimensions i and i + 32,
+    //             a rotation pair; `rope` is the [position][32] table of (cos, sin), and row r is
+    //             position r.
+    // - lnrope:   LayerNorm first, with γ folded into w and colsum[j] = Σₖ w[j, k]:
     //             LN(a) · wᵀ = rstd · (a · wᵀ − mean · colsum). The row statistics (Σa, Σa² per
-    //             row, `stats_in`) come from the GEMM that wrote a (resstats).
-    // - lngeglu:  ln, then GeGLU: c[r, j] = GELU(input) · gate, over weights interleaved so that
+    //             row, `stats_in`) come from the GEMM that wrote a (resstats). Then RoPE.
+    // - lngeglu:  LayerNorm as in lnrope, then GeGLU: c[r, j] = GELU(input) · gate, over weights interleaved so that
     //             each warp's n8 fragments 2q and 2q + 1 are the same 8 input and gate columns
     //             (weights::interleave_geglu). c is [m, n/2].
     // - resstats: c = a · wᵀ + res (`res` may alias c), and each output row's Σ and Σ² (of the
@@ -201,9 +205,10 @@ mod kernels {
     const EPI_GEGLU: u32 = 2;
     const EPI_LN: u32 = 4;
     const EPI_STATS: u32 = 8;
+    const EPI_ROPE: u32 = 16;
 
     /// gemm_{shape}_{epilogue}(a, w, c, res, ws, counters, stats_in, colsum, stats_out, zero,
-    /// zero_len, m, n, k, eps): grid (n/64, ⌈m/BM⌉, splits), 64·WR threads.
+    /// zero_len, m, n, k, eps, rope): grid (n/64, ⌈m/BM⌉, splits), 64·WR threads.
     macro_rules! gemm {
         ($name:ident, $mi:literal, $wr:literal, $epi:expr) => {
             #[kernel]
@@ -223,6 +228,7 @@ mod kernels {
                 n: u32,
                 k: u32,
                 eps: f32,
+                rope: *const f32,
             ) {
                 // A const, not `$epi` inline: #[kernel] re-tokenizes the body, so `A | B` pasted
                 // into `$epi & C` would parse as `A | (B & C)`.
@@ -269,6 +275,26 @@ mod kernels {
                                 // SAFETY: colsum has n values and col + 1 < n.
                                 let (s0, s1) = unsafe { (*colsum.add(col), *colsum.add(col + 1)) };
                                 v[j] = [rstd * (v[j][0] - mean * s0), rstd * (v[j][1] - mean * s1)];
+                            }
+                        }
+                        if (EPI & EPI_ROPE) != 0 && ok {
+                            #[unroll]
+                            for j in 0..4usize {
+                                let col = cw + j as u32 * 8;
+                                // q and k are the first two thirds of qkv; a warp's 32 columns
+                                // lie in one 64-column head, so this is the same for the warp.
+                                if col < 2 * (n / 3) {
+                                    let pair = ((col % 64) / 2) as usize;
+                                    // SAFETY: the table has (cos, sin) for 32 pairs of at least
+                                    // m positions (the host checks), and r < m.
+                                    let (cs, sn) = unsafe {
+                                        let t = rope.add((r as usize * 32 + pair) * 2);
+                                        (*t, *t.add(1))
+                                    };
+                                    // julia-rs: x1·c − x2·s, x2·c + x1·s (x1 = dim i, x2 = i + 32).
+                                    let [x1, x2] = v[j];
+                                    v[j] = [x1 * cs - x2 * sn, x2 * cs + x1 * sn];
+                                }
                             }
                         }
                         if (EPI & EPI_GEGLU) != 0 {
@@ -332,20 +358,20 @@ mod kernels {
             }
         };
     }
-    gemm!(gemm_32_plain, 1, 2, 0);
-    gemm!(gemm_32_ln, 1, 2, EPI_LN);
+    gemm!(gemm_32_rope, 1, 2, EPI_ROPE);
+    gemm!(gemm_32_lnrope, 1, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_32_lngeglu, 1, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_32_resstats, 1, 2, EPI_RES | EPI_STATS);
-    gemm!(gemm_64_plain, 2, 2, 0);
-    gemm!(gemm_64_ln, 2, 2, EPI_LN);
+    gemm!(gemm_64_rope, 2, 2, EPI_ROPE);
+    gemm!(gemm_64_lnrope, 2, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_64_lngeglu, 2, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_64_resstats, 2, 2, EPI_RES | EPI_STATS);
-    gemm!(gemm_128_plain, 4, 2, 0);
-    gemm!(gemm_128_ln, 4, 2, EPI_LN);
+    gemm!(gemm_128_rope, 4, 2, EPI_ROPE);
+    gemm!(gemm_128_lnrope, 4, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_128_lngeglu, 4, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_128_resstats, 4, 2, EPI_RES | EPI_STATS);
-    gemm!(gemm_128w8_plain, 2, 4, 0);
-    gemm!(gemm_128w8_ln, 2, 4, EPI_LN);
+    gemm!(gemm_128w8_rope, 2, 4, EPI_ROPE);
+    gemm!(gemm_128w8_lnrope, 2, 4, EPI_LN | EPI_ROPE);
     gemm!(gemm_128w8_lngeglu, 2, 4, EPI_LN | EPI_GEGLU);
     gemm!(gemm_128w8_resstats, 2, 4, EPI_RES | EPI_STATS);
 }

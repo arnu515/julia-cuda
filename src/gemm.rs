@@ -54,10 +54,11 @@ impl Shape {
 /// What the GEMM does around `a · wᵀ`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Epilogue {
-    /// `c = a · wᵀ`.
-    Plain,
-    /// `c = LayerNorm(a) · wᵀ`, with γ folded into `w` (needs `Ln`).
-    Ln,
+    /// `c = a · wᵀ`, then RoPE on the q and k thirds of c, over `prep::permute_rope`d weights
+    /// (needs `rope`).
+    Rope,
+    /// `c = LayerNorm(a) · wᵀ`, with γ folded into `w` (needs `ln`), then RoPE as `Rope`.
+    LnRope,
     /// `c = GeGLU(LayerNorm(a) · wᵀ)` over GeGLU-interleaved `w`; `c` is `[m, n/2]`.
     LnGeglu,
     /// `c += a · wᵀ` (the residual stream, in place), and each row's Σ and Σ² of the result are
@@ -66,8 +67,8 @@ pub enum Epilogue {
 }
 
 const EPILOGUES: [Epilogue; 4] = [
-    Epilogue::Plain,
-    Epilogue::Ln,
+    Epilogue::Rope,
+    Epilogue::LnRope,
     Epilogue::LnGeglu,
     Epilogue::ResStats,
 ];
@@ -75,8 +76,8 @@ const EPILOGUES: [Epilogue; 4] = [
 impl Epilogue {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Plain => "plain",
-            Self::Ln => "ln",
+            Self::Rope => "rope",
+            Self::LnRope => "lnrope",
             Self::LnGeglu => "lngeglu",
             Self::ResStats => "resstats",
         }
@@ -173,7 +174,7 @@ impl Scratch {
     }
 }
 
-/// LayerNorm inputs for `Ln` / `LnGeglu`: the row statistics of `a` (Σ, Σ² per row, as a
+/// LayerNorm inputs for `LnRope` / `LnGeglu`: the row statistics of `a` (Σ, Σ² per row, as a
 /// `ResStats` GEMM writes them) and the folded weights' column sums.
 pub struct LnInputs<'a, 'b> {
     pub stats: &'b CudaSlice<f32>,
@@ -188,8 +189,11 @@ pub struct Gemm<'a, 'b> {
     pub w: &'b CudaView<'a, f16>,
     pub k: usize,
     pub c: &'b mut CudaSlice<f16>,
-    /// For `Ln` / `LnGeglu`.
+    /// For `LnRope` / `LnGeglu`.
     pub ln: Option<LnInputs<'a, 'b>>,
+    /// For `Rope` / `LnRope`: (cos, sin) per position (row) and pair, `[≥ m][32][2]`
+    /// (`prep::rope_table`).
+    pub rope: Option<&'b CudaView<'a, f32>>,
     /// For `ResStats`: `2m` floats, zero beforehand, that the row statistics are added to.
     pub stats_out: Option<&'b mut CudaSlice<f32>>,
     /// A buffer to clear on the way (the `stats_out` of a later `ResStats` GEMM).
@@ -244,7 +248,7 @@ pub fn launch(
                 && tiles <= scratch.counters.len()),
         "gemm: the split-K scratch is too small for m = {m}"
     );
-    let needs_ln = matches!(g.epi, Epilogue::Ln | Epilogue::LnGeglu);
+    let needs_ln = matches!(g.epi, Epilogue::LnRope | Epilogue::LnGeglu);
     ensure!(
         g.ln.is_some() == needs_ln,
         "gemm: LayerNorm inputs go with the ln epilogues"
@@ -253,6 +257,17 @@ pub fn launch(
         ensure!(
             ln.stats.len() >= 2 * m && ln.colsum.len() == n,
             "gemm: LayerNorm statistics or column sums have the wrong size"
+        );
+    }
+    let needs_rope = matches!(g.epi, Epilogue::Rope | Epilogue::LnRope);
+    ensure!(
+        g.rope.is_some() == needs_rope,
+        "gemm: a RoPE table goes with the rope epilogues"
+    );
+    if let Some(rope) = g.rope {
+        ensure!(
+            rope.len() >= m * 64 && n.is_multiple_of(3 * 64),
+            "gemm: the RoPE table is too short for {m} positions, or n = {n} isn't qkv"
         );
     }
     ensure!(
@@ -275,6 +290,7 @@ pub fn launch(
         None => (null, null, 0.0),
     };
     let stats_out = g.stats_out.as_deref().map_or(null, |s| ptr(stream, s));
+    let rope = g.rope.map_or(null, |r| ptr(stream, r));
     let (zero, zero_len) = g
         .zero
         .as_deref()
@@ -297,7 +313,7 @@ pub fn launch(
     let f = kernels.get(cfg.shape, g.epi);
     let mut launch = stream.launch_builder(f);
     // gemm_*(a, w, c, res, ws, counters, stats_in, colsum, stats_out, zero, zero_len, m, n, k,
-    // eps): pointers are u64, the rest u32 / f32.
+    // eps, rope): pointers are u64, the rest u32 / f32.
     launch
         .arg(&a)
         .arg(&w)
@@ -313,9 +329,10 @@ pub fn launch(
         .arg(&m32)
         .arg(&n32)
         .arg(&k32)
-        .arg(&eps);
+        .arg(&eps)
+        .arg(&rope);
     // SAFETY: the checks above are the kernel's requirements: the sizes of a, w, c, the LN
-    // inputs and the statistics, n % 64, k % 32, the scratch size for split-K, and a null pointer
+    // inputs, the RoPE table and the statistics, n % 64, k % 32, the scratch size for split-K, and a null pointer
     // only where the epilogue doesn't read it. The buffers are cudarc allocations or weight spans
     // (16-byte aligned, rows of k a multiple of 32 elements). res aliasing c is allowed; `zero`
     // is not read by this GEMM. The block size matches the kernel's shape.

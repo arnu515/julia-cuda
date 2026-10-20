@@ -137,7 +137,8 @@ pub fn qkv0(
     x: &[f16],
     qkv: &[f16],
 ) -> color_eyre::Result<()> {
-    let got: Vec<f32> = qkv.iter().map(|v| v.to_f32()).collect();
+    // Wqkv's q and k rows are permuted for RoPE, which this kernel doesn't apply.
+    let got = to_f32(&unpermute_rope(qkv));
     let mut want = vec![0.0; ids.len() * 3 * D];
     linear(
         &model.embed(ids),
@@ -148,8 +149,7 @@ pub fn qkv0(
     let rel = rel_err(&got, &want);
 
     let emu = emulate_gemm(x, &host.f16[host.layout.layers[0].wqkv.range()], D);
-    let emu_f32: Vec<f32> = emu.iter().map(|v| v.to_f32()).collect();
-    let rel_emu = rel_err(&got, &emu_f32);
+    let rel_emu = rel_err(&to_f32(qkv), &to_f32(&emu));
     let worst = emu.iter().zip(qkv).map(|(&a, &b)| ulps(a, b)).max();
     eprintln!(
         "qkv (layer 0): vs julia-rs {rel:.2e} relative; vs emulation {rel_emu:.2e} relative, \
@@ -165,7 +165,7 @@ pub fn qkv0(
 pub struct LayerTrace {
     /// The residual stream entering the layer, `[n, D]`.
     pub x_in: Vec<f32>,
-    /// LN(x_in) · Wqkvᵀ (no LayerNorm in layer 0), before RoPE.
+    /// LN(x_in) · Wqkvᵀ (no LayerNorm in layer 0), after RoPE (on q and k).
     pub qkv: Vec<f32>,
     /// The attention output, before Wo.
     pub o: Vec<f32>,
@@ -200,12 +200,12 @@ pub fn trace(model: &Model, tokens: &[u32]) -> Vec<LayerTrace> {
         }
         let mut qkv = vec![0.0; n * 3 * d];
         linear(&h, &p.wqkv, None, &mut qkv);
-        let pre_rope = qkv.clone();
         let (rope, window) = match l.global {
             true => (&rope_g, None),
             false => (&rope_l, Some(model.config.local_window / 2)),
         };
         rope.apply(&mut qkv, d);
+        let qkv = qkv;
         let mut o = vec![0.0; n * d];
         attention(&qkv, n, d, window, &mut o, &mut s);
         linear_add(&o, &p.wo, None, &mut x);
@@ -217,7 +217,7 @@ pub fn trace(model: &Model, tokens: &[u32]) -> Vec<LayerTrace> {
         linear_add(&m, &p.wo_mlp, None, &mut x);
         out.push(LayerTrace {
             x_in,
-            qkv: pre_rope,
+            qkv: qkv.clone(),
             o,
             x_mid,
             m,
@@ -242,6 +242,22 @@ pub fn layernorm_rows(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
             *o = ((f64::from(v) - mean) * r * f64::from(g)) as f32;
         }
     }
+}
+
+/// `qkv` (rows of `[q | k | v]`) from the GPU's order, with q and k permuted for RoPE
+/// (`prep::permute_rope`), back to the checkpoint's.
+pub fn unpermute_rope<T: Copy + Default>(qkv: &[T]) -> Vec<T> {
+    let order = crate::prep::permute_rope(&(0..3 * D).collect::<Vec<_>>(), 1);
+    let mut out = vec![T::default(); qkv.len()];
+    let (rows, []) = qkv.as_chunks::<{ 3 * D }>() else {
+        panic!("qkv is not whole rows")
+    };
+    for (src, dst) in rows.iter().zip(out.as_chunks_mut::<{ 3 * D }>().0) {
+        for (p, &o) in order.iter().enumerate() {
+            dst[o] = src[p];
+        }
+    }
+    out
 }
 
 fn to_f16(v: &[f32]) -> Vec<f16> {
@@ -284,7 +300,8 @@ fn stats_err(x: &[f16], stats: &[f32], k: usize) -> f64 {
 pub trait LayerGemms {
     /// Replaces the stream with `x` (and the row statistics the next qkv reads with its own).
     fn set_stream(&mut self, x: &[f16]) -> color_eyre::Result<()>;
-    /// The stream's qkv for layer `l` (LayerNorm folded in from layer 1).
+    /// The stream's qkv for layer `l` (LayerNorm folded in from layer 1, RoPE applied), q and k
+    /// in the permuted order.
     fn qkv(&mut self, l: usize) -> color_eyre::Result<Vec<f16>>;
     /// stream += o · Woᵀ; returns the stream and its row statistics.
     fn wo(&mut self, l: usize, o: &[f16]) -> color_eyre::Result<(Vec<f16>, Vec<f32>)>;
@@ -334,7 +351,7 @@ pub fn layer(g: &mut impl LayerGemms, l: usize, t: &LayerTrace) -> color_eyre::R
     let m = g.wi(l)?;
     let (x_out, s2) = g.wo_mlp(l)?;
     Ok(LayerErrors {
-        qkv: rel_err(&to_f32(&qkv), &t.qkv),
+        qkv: rel_err(&to_f32(&unpermute_rope(&qkv)), &t.qkv),
         x_mid: rel_err(&to_f32(&x_mid), &t.x_mid),
         m: rel_err(&to_f32(&m), &t.m),
         x_out: rel_err(&to_f32(&x_out), &t.x_out),
@@ -473,13 +490,19 @@ impl<'a> GpuGemms<'a> {
         let lay = &self.w.layout.layers[l];
         let w = self.w.f16.slice(lay.wqkv.range());
         let colsum = lay.qkv_colsum.map(|c| self.w.f32.slice(c.range()));
+        let table = match lay.global {
+            true => self.w.layout.rope_global,
+            false => self.w.layout.rope_local,
+        };
+        let rope = self.w.f32.slice(table.range());
         let cfg = self.config_for(3 * D, D);
         let g = Gemm {
             epi: if colsum.is_some() {
-                Epilogue::Ln
+                Epilogue::LnRope
             } else {
-                Epilogue::Plain
+                Epilogue::Rope
             },
+            rope: Some(&rope),
             a: &self.x,
             w: &w,
             k: D,
@@ -508,6 +531,7 @@ impl<'a> GpuGemms<'a> {
             ln: None,
             stats_out: Some(&mut self.stats_attn),
             zero: None,
+            rope: None,
         };
         gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
     }
@@ -532,6 +556,7 @@ impl<'a> GpuGemms<'a> {
             }),
             stats_out: None,
             zero: Some(&mut self.stats_mlp),
+            rope: None,
         };
         gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
     }
@@ -550,6 +575,7 @@ impl<'a> GpuGemms<'a> {
             ln: None,
             stats_out: Some(&mut self.stats_mlp),
             zero: None,
+            rope: None,
         };
         gemm::launch(self.stream, self.kernels, self.scratch, cfg, g)
     }
@@ -714,6 +740,8 @@ struct HostGemms<'a> {
     stats_mlp: Vec<f32>,
     /// Reads Wi's output in checkpoint order (as if it weren't interleaved): a bug to catch.
     naive_geglu: bool,
+    /// Leaves RoPE out: another.
+    no_rope: bool,
 }
 
 #[cfg(test)]
@@ -786,6 +814,25 @@ impl LayerGemms for HostGemms<'_> {
         if let Some(c) = lay.qkv_colsum {
             Self::ln(&mut acc, &self.stats_mlp, &h.f32[c.range()], D, self.eps);
         }
+        // RoPE on the permuted pairs (2i, 2i + 1) of each q and k head; row r is position r.
+        let table = match lay.global {
+            true => h.layout.rope_global,
+            false => h.layout.rope_local,
+        };
+        let table = &h.f32[table.range()];
+        let rows = if self.no_rope {
+            &mut [][..]
+        } else {
+            acc.as_chunks_mut::<{ 3 * D }>().0
+        };
+        for (r, row) in rows.iter_mut().enumerate() {
+            for (p, pair) in row[..2 * D].as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let t = (r * 32 + p % 32) * 2;
+                let (cs, sn) = (table[t], table[t + 1]);
+                let [x1, x2] = *pair;
+                *pair = [x1 * cs - x2 * sn, x2 * cs + x1 * sn];
+            }
+        }
         self.stats_attn.fill(0.0);
         Ok(to_f16(&acc))
     }
@@ -846,7 +893,7 @@ mod layer_tests {
     use crate::checkpoint::Checkpoint;
 
     /// The layer check on the host emulation of the kernels: it must pass (this is where
-    /// the limits' margins come from), and a GeGLU read in the wrong order must fail.
+    /// the limits' margins come from), and a GeGLU read in the wrong order or a missing RoPE must fail.
     #[test]
     fn layer_check_passes_the_emulation() {
         let dir = std::env::var_os("JULIA_MODEL")
@@ -871,7 +918,7 @@ mod layer_tests {
         .unwrap();
         let n = seq.ids.len();
         let traces = trace(&model, &seq.ids);
-        let gemms = |naive_geglu| HostGemms {
+        let gemms = |naive_geglu, no_rope| HostGemms {
             host: &host,
             eps: c.norm_eps,
             inter: c.intermediate,
@@ -880,13 +927,17 @@ mod layer_tests {
             stats_attn: vec![0.0; 2 * n],
             stats_mlp: vec![0.0; 2 * n],
             naive_geglu,
+            no_rope,
         };
-        let worst = layers(&mut gemms(false), &traces, false).unwrap();
+        let worst = layers(&mut gemms(false, false), &traces, false).unwrap();
         eprintln!("worst, per layer: {worst}");
-        let worst = layers(&mut gemms(false), &traces, true).unwrap();
+        let worst = layers(&mut gemms(false, false), &traces, true).unwrap();
         eprintln!("worst, chained: {worst}");
-        let e = layer(&mut gemms(true), 0, &traces[0]).unwrap();
+        let e = layer(&mut gemms(true, false), 0, &traces[0]).unwrap();
         eprintln!("naive GeGLU order, layer 0: {e}");
+        assert!(!within(e, MAX_ERR_CHAINED));
+        let e = layer(&mut gemms(false, true), 0, &traces[0]).unwrap();
+        eprintln!("no RoPE, layer 0: {e}");
         assert!(!within(e, MAX_ERR_CHAINED));
     }
 }

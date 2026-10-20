@@ -52,6 +52,47 @@ pub fn interleave_geglu<T: Copy>(w: &[T], k: usize) -> Vec<T> {
     out
 }
 
+/// Dimensions per attention head.
+pub const HEAD_DIM: usize = 64;
+
+/// Wqkv's rows (`[3d, k]`: q, k and v, each `d` rows of heads of 64) reordered for the GEMM's
+/// RoPE epilogue: in each q and k head, packed rows 2i and 2i + 1 are dimensions i and i + 32,
+/// the pair RoPE rotates together (rotate-half), so one thread holds both. V stays in order.
+/// q and k can stay permuted in memory: attention only takes their dot products, which the
+/// same permutation of both doesn't change. `k = 1` reorders a per-row vector (colsum).
+pub fn permute_rope<T: Copy>(w: &[T], k: usize) -> Vec<T> {
+    let n = w.len() / k;
+    assert!(w.len() == n * k && n.is_multiple_of(3 * HEAD_DIM));
+    let mut out = Vec::with_capacity(w.len());
+    for p in 0..n {
+        let src = if p < 2 * n / 3 {
+            let (head, i) = (p / HEAD_DIM, p % HEAD_DIM);
+            head * HEAD_DIM + i / 2 + (i % 2) * (HEAD_DIM / 2)
+        } else {
+            p
+        };
+        out.extend_from_slice(&w[src * k..][..k]);
+    }
+    out
+}
+
+/// RoPE's (cos, sin) for positions `0..n` and pairs `0..32`, `[n][32][2]`: computed as julia-rs
+/// (and HF's `ModernBertRotaryEmbedding`) does, in f32.
+pub fn rope_table(theta: f32, n: usize) -> Vec<f32> {
+    let half = HEAD_DIM / 2;
+    let inv: Vec<f32> = (0..half)
+        .map(|j| 1.0 / theta.powf((2 * j) as f32 / HEAD_DIM as f32))
+        .collect();
+    (0..n)
+        .flat_map(|p| {
+            inv.iter().flat_map(move |&f| {
+                let a = p as f32 * f;
+                [a.cos(), a.sin()]
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -206,6 +247,19 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&s| s), "every output column is produced");
+    }
+
+    /// The permutation against the RoPE epilogue: in q and k, packed columns 2i, 2i + 1 of each
+    /// head are its dimensions i and i + 32; v is unchanged.
+    #[test]
+    fn rope_permutation_pairs_rotate_half_dims() {
+        let n = 3 * 384;
+        let rows = permute_rope(&(0..n).collect::<Vec<_>>(), 1);
+        for p in (0..2 * 384).step_by(2) {
+            let (head, i) = (p / 64, (p % 64) / 2);
+            assert_eq!((rows[p], rows[p + 1]), (64 * head + i, 64 * head + i + 32));
+        }
+        assert!((2 * 384..n).all(|p| rows[p] == p));
     }
 
     /// Largest |mean| / std over the rows: how much the fold's cancellation has to cancel.
