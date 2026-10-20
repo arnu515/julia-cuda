@@ -30,7 +30,10 @@ const BK: usize = 32;
 
 #[cuda_module]
 mod kernels {
-    use cuda_device::{SharedArray, device, vector::U16x8};
+    use cuda_device::{
+        SharedArray, device,
+        vector::{U16x8, U32x4},
+    };
 
     use crate::helpers::warp_sum;
 
@@ -329,10 +332,17 @@ mod kernels {
         let nkb = kb1 - kb0;
         let (kb0, kb1) = (kb0 + chunk * nkb / chunks, kb0 + (chunk + 1) * nkb / chunks);
 
-        // This warp's 16 queries as A fragments, one per 16 dimensions.
+        // This warp's 16 queries as A fragments, one per 16 dimensions. The first key block's K
+        // and V come into registers with Q (one round trip for the three), and each later one
+        // while the block computes on the one before (in registers, so the shared tiles stay
+        // three).
         let mut qf = [[0u32; 4]; 4];
+        let (mut kn, mut vn) = ([U32x4([0; 4]); 4], [U32x4([0; 4]); 4]);
         if kb0 < kb1 {
-            attn::load_tile(qkv, qs, n, q0, head, 0);
+            let q = attn::load_tile_regs(qkv, n, q0, head, 0);
+            kn = attn::load_tile_regs(qkv, n, kb0 * attn::BQ as u32, head, 1);
+            vn = attn::load_tile_regs(qkv, n, kb0 * attn::BQ as u32, head, 2);
+            attn::store_tile(qs, &q);
             thread::sync_threads();
             #[unroll]
             for ks_ in 0..4u32 {
@@ -353,9 +363,15 @@ mod kernels {
         let mut kb = kb0;
         while kb < kb1 {
             let k0 = kb * attn::BQ as u32;
-            attn::load_tile(qkv, ks, n, k0, head, 1);
-            attn::load_tile(qkv, vs, n, k0, head, 2);
+            attn::store_tile(ks, &kn);
+            attn::store_tile(vs, &vn);
             thread::sync_threads();
+            // The next key block's, in flight during this one's arithmetic (the barrier at the end
+            // of the step keeps ks and vs from being overwritten while read).
+            if kb + 1 < kb1 {
+                kn = attn::load_tile_regs(qkv, n, k0 + attn::BQ as u32, head, 1);
+                vn = attn::load_tile_regs(qkv, n, k0 + attn::BQ as u32, head, 2);
+            }
 
             // S = Q·Kᵀ for this warp's 16 queries × 64 keys: 8 n8 tiles.
             let mut s = [[0f32; 4]; 8];

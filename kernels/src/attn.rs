@@ -41,25 +41,40 @@ pub fn ldsm_x4_trans(addr: u32) -> [u32; 4] {
     [a, b, c, d]
 }
 
-/// One head's 64 rows starting at `row0` of the third `third` (0 q, 1 k, 2 v) into a swizzled
-/// shared tile, 4 chunks per thread (128 threads); rows past n are zero.
+/// Thread t's 4 chunks (16 bytes each; chunk c = t + 128i is row c / 8, chunk c % 8) of one
+/// head's 64 rows starting at `row0` of the third `third` (0 q, 1 k, 2 v), into registers; rows
+/// past n are zero. `store_tile` puts them in a swizzled shared tile; apart, the loads can be in
+/// flight while the block computes on the previous tile.
 #[device]
-pub fn load_tile(qkv: *const u16, tile: *mut u16, n: u32, row0: u32, head: u32, third: u32) {
+pub fn load_tile_regs(qkv: *const u16, n: u32, row0: u32, head: u32, third: u32) -> [U32x4; 4] {
     let tid = thread::threadIdx_x();
+    let mut v = [U32x4([0; 4]); 4];
     #[unroll]
     for i in 0..4u32 {
         let c = tid + 128 * i;
         let (row, ch) = (c >> 3, c & 7);
         let r = row0 + row;
-        let mut v = U32x4([0; 4]);
         if r < n {
             let col = third * D as u32 + head * HD as u32 + ch * 8;
             // SAFETY: r < n and col + 8 <= 3·D: inside qkv; 16-byte aligned (rows of 3·D f16,
             // col a multiple of 8, and the host passes a 16-byte aligned buffer).
-            v = unsafe { *(qkv.add(r as usize * 3 * D + col as usize) as *const U32x4) };
+            v[i as usize] =
+                unsafe { *(qkv.add(r as usize * 3 * D + col as usize) as *const U32x4) };
         }
+    }
+    v
+}
+
+/// `load_tile_regs`'s chunks into the swizzled shared tile `tile` ([64][64] f16).
+#[device]
+pub fn store_tile(tile: *mut u16, v: &[U32x4; 4]) {
+    let tid = thread::threadIdx_x();
+    #[unroll]
+    for i in 0..4u32 {
+        let c = tid + 128 * i;
+        let (row, ch) = (c >> 3, c & 7);
         // SAFETY: row < 64, ch < 8: inside the tile; each thread writes its own chunks.
-        unsafe { *(tile.add(swz64(row, ch) as usize) as *mut U32x4) = v };
+        unsafe { *(tile.add(swz64(row, ch) as usize) as *mut U32x4) = v[i as usize] };
     }
 }
 
