@@ -17,6 +17,7 @@ average), RTX 2080 Ti, one request at a time:
 | engine | correct | same answer as julia-rs f32 | mean latency per request |
 | --- | ---: | ---: | ---: |
 | julia-cuda | 1451 | 2000 / 2000 | 2.16 ms (1.95 ms on the GPU) |
+| original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms |
 | original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms |
 | julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) |
 
