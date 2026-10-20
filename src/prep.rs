@@ -34,6 +34,30 @@ pub fn fold_layernorm(w: &[f32], gamma: &[f32]) -> FoldedLinear {
     FoldedLinear { w, colsum }
 }
 
+/// A linear layer (`w` `[out, in]`, bias `b`) after a LayerNorm with a bias (`γ`, `β`), as in
+/// the head and the scorer, folded like [`fold_layernorm`]; the LayerNorm's bias goes into the
+/// linear's: `LN(x)·Wᵀ + b = r·(x·W'ᵀ − μ·colsum) + (b + W·β)`. Returns the folded linear and
+/// `b + W·β` (from the f32 `W`, in f64).
+pub fn fold_layernorm_bias(
+    w: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    b: &[f32],
+) -> (FoldedLinear, Vec<f32>) {
+    let k = gamma.len();
+    let bias = (w.chunks_exact(k).zip(b))
+        .map(|(row, &b)| {
+            let wb: f64 = row
+                .iter()
+                .zip(beta)
+                .map(|(&w, &x)| f64::from(w) * f64::from(x))
+                .sum();
+            (f64::from(b) + wb) as f32
+        })
+        .collect();
+    (fold_layernorm(w, gamma), bias)
+}
+
 /// Wi's rows (`[n, k]`, n = 2·intermediate: the GELU inputs, then the gates) reordered for the
 /// GEMM's fused GeGLU epilogue. In each 64-row tile, a warp's 32 rows are its four n8 fragments:
 /// fragments 2q and 2q + 1 hold the same 8 output columns' input and gate rows. So packed row
@@ -190,7 +214,7 @@ mod tests {
             for (name, x, gamma, w) in gemms {
                 let (gamma, w) = (gamma.as_f32(data), w.as_f32(data));
                 let mut h = vec![0.0; x.len()];
-                crate::check::layernorm_rows(x, gamma, eps, &mut h);
+                crate::check::layernorm_rows(x, gamma, None, eps, &mut h);
                 let reference = matmul(&h, w, d);
 
                 let plain = f16_round(&matmul(&f16_round(&h), &f16_round(w), d));
@@ -247,6 +271,46 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&s| s), "every output column is produced");
+    }
+
+    /// The bias fold against LayerNorm (with bias) then linear (with bias), in f64 on random
+    /// rows with a non-zero mean.
+    #[test]
+    fn bias_fold_matches_layernorm_then_linear() {
+        let (k, out, rows) = (64, 32, 5);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let w: Vec<f32> = (0..out * k).map(|_| rnd()).collect();
+        let (gamma, beta): (Vec<f32>, Vec<f32>) = (0..k).map(|_| (1.0 + rnd(), rnd())).unzip();
+        let b: Vec<f32> = (0..out).map(|_| rnd()).collect();
+        let x: Vec<f32> = (0..rows * k).map(|_| 3.0 + rnd()).collect();
+        let (f, bias) = fold_layernorm_bias(&w, &gamma, &beta, &b);
+        let wf: Vec<f64> = f.w.iter().map(|&v| f64::from(v)).collect();
+        for row in x.chunks_exact(k) {
+            let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / k as f64;
+            let var = row
+                .iter()
+                .map(|&v| (f64::from(v) - mean).powi(2))
+                .sum::<f64>()
+                / k as f64;
+            let r = 1.0 / (var + 1e-5).sqrt();
+            for j in 0..out {
+                let ln = |i: usize| {
+                    (f64::from(row[i]) - mean) * r * f64::from(gamma[i]) + f64::from(beta[i])
+                };
+                let want: f64 =
+                    (0..k).map(|i| ln(i) * f64::from(w[j * k + i])).sum::<f64>() + f64::from(b[j]);
+                let acc: f64 = (0..k).map(|i| f64::from(row[i]) * wf[j * k + i]).sum();
+                let got = r * (acc - mean * f64::from(f.colsum[j])) + f64::from(bias[j]);
+                // The fold's f16 weights cost ~1e-3 of the output's scale.
+                assert!((got - want).abs() < 2e-2, "row output {j}: {got} vs {want}");
+            }
+        }
     }
 
     /// The permutation against the RoPE epilogue: in q and k, packed columns 2i, 2i + 1 of each

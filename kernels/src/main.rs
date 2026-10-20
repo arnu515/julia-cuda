@@ -98,6 +98,95 @@ mod kernels {
         }
     }
 
+    /// The head's input: out = LayerNorm(x)·γ + add per row (the encoder's final norm, then the
+    /// question type's embedding), and each output row's Σ and Σ² (of the stored f16 values) into
+    /// `stats` (written, not added). One warp per row, as `embed`.
+    #[kernel]
+    pub fn norm_add(x: &[f16], gamma: &[f32], add: &[f32], eps: f32, out: *mut f16, stats: *mut f32) {
+        let tid = thread::index_1d().get();
+        let (row, lane) = (tid / 32, tid % 32);
+        if row >= x.len() / D {
+            return;
+        }
+        let src = &x[row * D..][..D];
+        let mut v = [0f32; PER_LANE];
+        #[unroll]
+        for j in 0..PER_LANE / CHUNK_SIZE {
+            let c = j * 32 + lane;
+            // SAFETY: c < 96, so elements 4c..4c + 4 are inside the row; 8-byte aligned: x is a
+            // cudarc allocation and rows are 768 bytes.
+            let q = unsafe { *(src.as_ptr().add(c * 4) as *const U16x4) }.to_array();
+            #[unroll]
+            for i in 0..4 {
+                v[j * 4 + i] = f16::from_bits(q[i]) as f32;
+            }
+        }
+        // SAFETY: all 32 lanes get here: whole warps (the host's block size is a multiple of 32)
+        // and the early return is the same for a warp's lanes.
+        let mean = unsafe { warp_sum(v.iter().sum::<f32>()) } / D as f32;
+        // SAFETY: as for the mean.
+        let var = unsafe { warp_sum(v.iter().map(|&a| (a - mean) * (a - mean)).sum::<f32>()) } / D as f32;
+        let rstd = 1f32 / (var + eps).sqrt();
+        let (mut s, mut s2) = (0f32, 0f32);
+        #[unroll]
+        for j in 0..PER_LANE / CHUNK_SIZE {
+            let c = j * 32 + lane;
+            // SAFETY: 4c..4c + 4 is inside gamma's and add's D values; 16-byte aligned (weight
+            // spans start on 128-byte boundaries, element 4c is 16c bytes in).
+            let (g, a) = unsafe {
+                (
+                    (*(gamma.as_ptr().add(c * 4) as *const F32x4)).to_array(),
+                    (*(add.as_ptr().add(c * 4) as *const F32x4)).to_array(),
+                )
+            };
+            let mut o = [0u16; 4];
+            #[unroll]
+            for i in 0..4 {
+                let y = ((v[j * 4 + i] - mean) * rstd * g[i] + a[i]) as f16;
+                o[i] = y.to_bits();
+                let y = y as f32;
+                s += y;
+                s2 += y * y;
+            }
+            // SAFETY: row < rows of x, and out is as long as x; each warp writes its own row,
+            // each lane its own chunks; 8-byte aligned.
+            unsafe { *(out.add(row * D + c * 4) as *mut U16x4) = U16x4::new(o) };
+        }
+        // SAFETY: as for the mean.
+        let (s, s2) = unsafe { (warp_sum(s), warp_sum(s2)) };
+        if lane == 0 {
+            // SAFETY: stats has 2 values per row of x.
+            unsafe {
+                *stats.add(2 * row) = s;
+                *stats.add(2 * row + 1) = s2;
+            }
+        }
+    }
+
+    /// The scorer's last linear (D → 1) on the marker rows: logits[i] = y[markers[i]] · w + b.
+    /// One warp per marker.
+    #[kernel]
+    pub fn score(y: &[f16], w: &[f16], b: f32, markers: &[u32], logits: *mut f32) {
+        let tid = thread::index_1d().get();
+        let (i, lane) = (tid / 32, tid % 32);
+        if i >= markers.len() {
+            return;
+        }
+        let row = &y[markers[i] as usize * D..][..D];
+        let mut acc = 0f32;
+        #[unroll]
+        for j in 0..PER_LANE {
+            let c = j * 32 + lane;
+            acc += (row[c] as f32) * (w[c] as f32);
+        }
+        // SAFETY: whole warps, and the early return is the same for a warp's lanes.
+        let acc = unsafe { warp_sum(acc) };
+        if lane == 0 {
+            // SAFETY: logits has one value per marker.
+            unsafe { *logits.add(i) = acc + b };
+        }
+    }
+
     #[kernel]
     pub fn gemm_tiled(a: &[f16], w: &[f16], k: u32, c: *mut f16) {
         let k = k as usize;
@@ -361,6 +450,12 @@ mod kernels {
     // - resstats: c = a · wᵀ + res (`res` may alias c), and each output row's Σ and Σ² (of the
     //             stored f16 values) are added to `stats_out`, which must be zero beforehand.
     //
+    // The head's GEMMs (LayerNorms with a bias, folded too: b' = b + W·β, see prep):
+    // - lnbias:       LayerNorm, + bias (in_proj).
+    // - lnbiasrelu:   LayerNorm, + bias, ReLU (linear1).
+    // - lnbiasgelu:   LayerNorm, + bias, GELU (the scorer's first linear).
+    // - biasresstats: + bias, then resstats (out_proj, linear2).
+    //
     // Any GEMM can also clear `zero_len` floats at `zero` (the statistics buffer the next
     // resstats GEMM accumulates into). Pointers an epilogue doesn't use may be null.
 
@@ -369,9 +464,12 @@ mod kernels {
     const EPI_LN: u32 = 4;
     const EPI_STATS: u32 = 8;
     const EPI_ROPE: u32 = 16;
+    const EPI_BIAS: u32 = 32;
+    const EPI_RELU: u32 = 64;
+    const EPI_GELU: u32 = 128;
 
     /// gemm_{shape}_{epilogue}(a, w, c, res, ws, counters, stats_in, colsum, stats_out, zero,
-    /// zero_len, m, n, k, eps, rope): grid (n/64, ⌈m/BM⌉, splits), 64·WR threads.
+    /// zero_len, m, n, k, eps, rope, bias): grid (n/64, ⌈m/BM⌉, splits), 64·WR threads.
     macro_rules! gemm {
         ($name:ident, $mi:literal, $wr:literal, $epi:expr) => {
             #[kernel]
@@ -392,6 +490,7 @@ mod kernels {
                 k: u32,
                 eps: f32,
                 rope: *const f32,
+                bias: *const f32,
             ) {
                 // A const, not `$epi` inline: #[kernel] re-tokenizes the body, so `A | B` pasted
                 // into `$epi & C` would parse as `A | (B & C)`.
@@ -438,6 +537,27 @@ mod kernels {
                                 // SAFETY: colsum has n values and col + 1 < n.
                                 let (s0, s1) = unsafe { (*colsum.add(col), *colsum.add(col + 1)) };
                                 v[j] = [rstd * (v[j][0] - mean * s0), rstd * (v[j][1] - mean * s1)];
+                            }
+                        }
+                        if (EPI & EPI_BIAS) != 0 {
+                            #[unroll]
+                            for j in 0..4usize {
+                                let col = (cw + j as u32 * 8) as usize;
+                                // SAFETY: bias has n values and col + 1 < n.
+                                let (b0, b1) = unsafe { (*bias.add(col), *bias.add(col + 1)) };
+                                v[j] = [v[j][0] + b0, v[j][1] + b1];
+                            }
+                        }
+                        if (EPI & EPI_RELU) != 0 {
+                            #[unroll]
+                            for j in 0..4usize {
+                                v[j] = [v[j][0].max(0.0), v[j][1].max(0.0)];
+                            }
+                        }
+                        if (EPI & EPI_GELU) != 0 {
+                            #[unroll]
+                            for j in 0..4usize {
+                                v[j] = [gemm::gelu(v[j][0]), gemm::gelu(v[j][1])];
                             }
                         }
                         if (EPI & EPI_ROPE) != 0 && ok {
@@ -525,18 +645,34 @@ mod kernels {
     gemm!(gemm_32_lnrope, 1, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_32_lngeglu, 1, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_32_resstats, 1, 2, EPI_RES | EPI_STATS);
+    gemm!(gemm_32_lnbias, 1, 2, EPI_LN | EPI_BIAS);
+    gemm!(gemm_32_lnbiasrelu, 1, 2, EPI_LN | EPI_BIAS | EPI_RELU);
+    gemm!(gemm_32_lnbiasgelu, 1, 2, EPI_LN | EPI_BIAS | EPI_GELU);
+    gemm!(gemm_32_biasresstats, 1, 2, EPI_BIAS | EPI_RES | EPI_STATS);
     gemm!(gemm_64_rope, 2, 2, EPI_ROPE);
     gemm!(gemm_64_lnrope, 2, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_64_lngeglu, 2, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_64_resstats, 2, 2, EPI_RES | EPI_STATS);
+    gemm!(gemm_64_lnbias, 2, 2, EPI_LN | EPI_BIAS);
+    gemm!(gemm_64_lnbiasrelu, 2, 2, EPI_LN | EPI_BIAS | EPI_RELU);
+    gemm!(gemm_64_lnbiasgelu, 2, 2, EPI_LN | EPI_BIAS | EPI_GELU);
+    gemm!(gemm_64_biasresstats, 2, 2, EPI_BIAS | EPI_RES | EPI_STATS);
     gemm!(gemm_128_rope, 4, 2, EPI_ROPE);
     gemm!(gemm_128_lnrope, 4, 2, EPI_LN | EPI_ROPE);
     gemm!(gemm_128_lngeglu, 4, 2, EPI_LN | EPI_GEGLU);
     gemm!(gemm_128_resstats, 4, 2, EPI_RES | EPI_STATS);
+    gemm!(gemm_128_lnbias, 4, 2, EPI_LN | EPI_BIAS);
+    gemm!(gemm_128_lnbiasrelu, 4, 2, EPI_LN | EPI_BIAS | EPI_RELU);
+    gemm!(gemm_128_lnbiasgelu, 4, 2, EPI_LN | EPI_BIAS | EPI_GELU);
+    gemm!(gemm_128_biasresstats, 4, 2, EPI_BIAS | EPI_RES | EPI_STATS);
     gemm!(gemm_128w8_rope, 2, 4, EPI_ROPE);
     gemm!(gemm_128w8_lnrope, 2, 4, EPI_LN | EPI_ROPE);
     gemm!(gemm_128w8_lngeglu, 2, 4, EPI_LN | EPI_GEGLU);
     gemm!(gemm_128w8_resstats, 2, 4, EPI_RES | EPI_STATS);
+    gemm!(gemm_128w8_lnbias, 2, 4, EPI_LN | EPI_BIAS);
+    gemm!(gemm_128w8_lnbiasrelu, 2, 4, EPI_LN | EPI_BIAS | EPI_RELU);
+    gemm!(gemm_128w8_lnbiasgelu, 2, 4, EPI_LN | EPI_BIAS | EPI_GELU);
+    gemm!(gemm_128w8_biasresstats, 2, 4, EPI_BIAS | EPI_RES | EPI_STATS);
 }
 
 // needed for binary crate; never ran.

@@ -11,7 +11,7 @@ use half::{f16, slice::HalfFloatSliceExt};
 
 use crate::{
     checkpoint::Checkpoint,
-    prep::{fold_layernorm, interleave_geglu, permute_rope, rope_table},
+    prep::{fold_layernorm, fold_layernorm_bias, interleave_geglu, permute_rope, rope_table},
 };
 
 /// Every span starts at a multiple of this many bytes: 16-byte vector loads and `ldmatrix` need
@@ -59,32 +59,33 @@ pub struct EncoderLayer {
     pub global: bool,
 }
 
-/// One head `nn.TransformerEncoderLayer`. Its LayerNorms have biases, so they aren't folded:
-/// the head is a few small GEMMs.
+/// One head `nn.TransformerEncoderLayer` (pre-LayerNorm). Its LayerNorms (with biases) are folded
+/// into in_proj and linear1 (`prep::fold_layernorm_bias`): γ into the weights, β into the biases.
 #[derive(Clone, Debug)]
 pub struct HeadLayer {
+    /// `[3·D, D]`, q, k and v (no RoPE in the head), norm1 folded in.
     pub in_proj: Span<f16>,
+    pub in_proj_colsum: Span<f32>,
     pub in_proj_b: Span<f32>,
     pub out_proj: Span<f16>,
     pub out_proj_b: Span<f32>,
+    /// `[head_ff, D]`, norm2 folded in.
     pub linear1: Span<f16>,
+    pub linear1_colsum: Span<f32>,
     pub linear1_b: Span<f32>,
     pub linear2: Span<f16>,
     pub linear2_b: Span<f32>,
-    pub norm1_w: Span<f32>,
-    pub norm1_b: Span<f32>,
-    pub norm2_w: Span<f32>,
-    pub norm2_b: Span<f32>,
 }
 
+/// LayerNorm (folded into lin1), lin1, GELU, lin2 (`[1, D]`).
 #[derive(Clone, Debug)]
 pub struct Scorer {
-    pub norm_w: Span<f32>,
-    pub norm_b: Span<f32>,
     pub lin1: Span<f16>,
+    pub lin1_colsum: Span<f32>,
     pub lin1_b: Span<f32>,
     pub lin2: Span<f16>,
-    pub lin2_b: Span<f32>,
+    /// lin2's single bias.
+    pub lin2_b: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -178,29 +179,46 @@ impl HostWeights {
         let final_norm = f.push(ck.f32(&enc.final_norm));
         let type_emb = f.push(ck.f32(&t.type_emb));
         let head = (t.head.iter())
-            .map(|l| HeadLayer {
-                in_proj: h.push_f32(ck.f32(&l.in_proj_w)),
-                in_proj_b: f.push(ck.f32(&l.in_proj_b)),
-                out_proj: h.push_f32(ck.f32(&l.out_proj_w)),
-                out_proj_b: f.push(ck.f32(&l.out_proj_b)),
-                linear1: h.push_f32(ck.f32(&l.linear1_w)),
-                linear1_b: f.push(ck.f32(&l.linear1_b)),
-                linear2: h.push_f32(ck.f32(&l.linear2_w)),
-                linear2_b: f.push(ck.f32(&l.linear2_b)),
-                norm1_w: f.push(ck.f32(&l.norm1_w)),
-                norm1_b: f.push(ck.f32(&l.norm1_b)),
-                norm2_w: f.push(ck.f32(&l.norm2_w)),
-                norm2_b: f.push(ck.f32(&l.norm2_b)),
+            .map(|l| {
+                let (inp, inp_b) = fold_layernorm_bias(
+                    ck.f32(&l.in_proj_w),
+                    ck.f32(&l.norm1_w),
+                    ck.f32(&l.norm1_b),
+                    ck.f32(&l.in_proj_b),
+                );
+                let (lin1, lin1_b) = fold_layernorm_bias(
+                    ck.f32(&l.linear1_w),
+                    ck.f32(&l.norm2_w),
+                    ck.f32(&l.norm2_b),
+                    ck.f32(&l.linear1_b),
+                );
+                HeadLayer {
+                    in_proj: h.push(&inp.w),
+                    in_proj_colsum: f.push(&inp.colsum),
+                    in_proj_b: f.push(&inp_b),
+                    out_proj: h.push_f32(ck.f32(&l.out_proj_w)),
+                    out_proj_b: f.push(ck.f32(&l.out_proj_b)),
+                    linear1: h.push(&lin1.w),
+                    linear1_colsum: f.push(&lin1.colsum),
+                    linear1_b: f.push(&lin1_b),
+                    linear2: h.push_f32(ck.f32(&l.linear2_w)),
+                    linear2_b: f.push(ck.f32(&l.linear2_b)),
+                }
             })
             .collect();
         let s = &t.scorer;
+        let (lin1, lin1_b) = fold_layernorm_bias(
+            ck.f32(&s.lin1_w),
+            ck.f32(&s.norm_w),
+            ck.f32(&s.norm_b),
+            ck.f32(&s.lin1_b),
+        );
         let scorer = Scorer {
-            norm_w: f.push(ck.f32(&s.norm_w)),
-            norm_b: f.push(ck.f32(&s.norm_b)),
-            lin1: h.push_f32(ck.f32(&s.lin1_w)),
-            lin1_b: f.push(ck.f32(&s.lin1_b)),
+            lin1: h.push(&lin1.w),
+            lin1_colsum: f.push(&lin1.colsum),
+            lin1_b: f.push(&lin1_b),
             lin2: h.push_f32(ck.f32(&s.lin2_w)),
-            lin2_b: f.push(ck.f32(&s.lin2_b)),
+            lin2_b: ck.f32(&s.lin2_b)[0],
         };
         Self {
             layout: Layout {
@@ -326,9 +344,18 @@ mod tests {
         }
         assert_eq!(f(l.head[1].linear2_b), ck.f32(&t.head[1].linear2_b));
         assert_eq!(h(l.scorer.lin2), f16_of(ck.f32(&t.scorer.lin2_w)));
+        let hl = &t.head[1];
+        let (inp, inp_b) = fold_layernorm_bias(
+            ck.f32(&hl.in_proj_w),
+            ck.f32(&hl.norm1_w),
+            ck.f32(&hl.norm1_b),
+            ck.f32(&hl.in_proj_b),
+        );
+        assert_eq!(f(l.head[1].in_proj_b), inp_b);
+        assert_eq!(f(l.head[1].in_proj_colsum), inp.colsum);
 
         let spans16 = [l.tok_embeddings, l.layers[7].wi, l.scorer.lin2];
-        let spans32 = [l.emb_norm, l.layers[7].wi_colsum, l.scorer.lin2_b];
+        let spans32 = [l.emb_norm, l.layers[7].wi_colsum, l.scorer.lin1_b];
         assert!(
             spans16
                 .iter()

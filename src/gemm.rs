@@ -64,13 +64,26 @@ pub enum Epilogue {
     /// `c += a · wᵀ` (the residual stream, in place), and each row's Σ and Σ² of the result are
     /// added to `stats_out`.
     ResStats,
+    /// `c = LayerNorm(a) · wᵀ + bias`, the LayerNorm with a bias folded too
+    /// (`prep::fold_layernorm_bias`): the head's in_proj.
+    LnBias,
+    /// `LnBias`, then ReLU: the head's linear1.
+    LnBiasRelu,
+    /// `LnBias`, then GELU: the scorer's first linear.
+    LnBiasGelu,
+    /// `c += a · wᵀ + bias`, with `ResStats`'s statistics: the head's out_proj and linear2.
+    BiasResStats,
 }
 
-const EPILOGUES: [Epilogue; 4] = [
+const EPILOGUES: [Epilogue; 8] = [
     Epilogue::Rope,
     Epilogue::LnRope,
     Epilogue::LnGeglu,
     Epilogue::ResStats,
+    Epilogue::LnBias,
+    Epilogue::LnBiasRelu,
+    Epilogue::LnBiasGelu,
+    Epilogue::BiasResStats,
 ];
 
 impl Epilogue {
@@ -80,11 +93,33 @@ impl Epilogue {
             Self::LnRope => "lnrope",
             Self::LnGeglu => "lngeglu",
             Self::ResStats => "resstats",
+            Self::LnBias => "lnbias",
+            Self::LnBiasRelu => "lnbiasrelu",
+            Self::LnBiasGelu => "lnbiasgelu",
+            Self::BiasResStats => "biasresstats",
         }
     }
 
     fn index(self) -> usize {
         EPILOGUES.iter().position(|&e| e == self).unwrap()
+    }
+
+    fn ln(self) -> bool {
+        matches!(
+            self,
+            Self::LnRope | Self::LnGeglu | Self::LnBias | Self::LnBiasRelu | Self::LnBiasGelu
+        )
+    }
+
+    fn res(self) -> bool {
+        matches!(self, Self::ResStats | Self::BiasResStats)
+    }
+
+    fn bias(self) -> bool {
+        matches!(
+            self,
+            Self::LnBias | Self::LnBiasRelu | Self::LnBiasGelu | Self::BiasResStats
+        )
     }
 }
 
@@ -130,14 +165,14 @@ pub fn choose(m: usize, n: usize, k: usize, sms: usize) -> Config {
     }
 }
 
-/// The 16 GEMM kernels (4 shapes × 4 epilogues).
+/// The 32 GEMM kernels (4 shapes × 8 epilogues).
 pub struct GemmKernels {
     fns: Vec<CudaFunction>,
 }
 
 impl GemmKernels {
     pub fn load(module: &Arc<CudaModule>) -> color_eyre::Result<Self> {
-        let mut fns = Vec::with_capacity(16);
+        let mut fns = Vec::with_capacity(SHAPES.len() * EPILOGUES.len());
         for shape in SHAPES {
             for epi in EPILOGUES {
                 fns.push(module.load_function(&format!("gemm_{}_{}", shape.name(), epi.name()))?);
@@ -174,7 +209,7 @@ impl Scratch {
     }
 }
 
-/// LayerNorm inputs for `LnRope` / `LnGeglu`: the row statistics of `a` (Σ, Σ² per row, as a
+/// LayerNorm inputs for the ln epilogues: the row statistics of `a` (Σ, Σ² per row, as a
 /// `ResStats` GEMM writes them) and the folded weights' column sums.
 pub struct LnInputs<'a, 'b> {
     pub stats: &'b CudaSlice<f32>,
@@ -189,12 +224,15 @@ pub struct Gemm<'a, 'b> {
     pub w: &'b CudaView<'a, f16>,
     pub k: usize,
     pub c: &'b mut CudaSlice<f16>,
-    /// For `LnRope` / `LnGeglu`.
+    /// For the ln epilogues.
     pub ln: Option<LnInputs<'a, 'b>>,
     /// For `Rope` / `LnRope`: (cos, sin) per position (row) and pair, `[≥ m][32][2]`
     /// (`prep::rope_table`).
     pub rope: Option<&'b CudaView<'a, f32>>,
-    /// For `ResStats`: `2m` floats, zero beforehand, that the row statistics are added to.
+    /// For the bias epilogues: `n` values.
+    pub bias: Option<&'b CudaView<'a, f32>>,
+    /// For the resstats epilogues: `2m` floats, zero beforehand, that the row statistics are
+    /// added to.
     pub stats_out: Option<&'b mut CudaSlice<f32>>,
     /// A buffer to clear on the way (the `stats_out` of a later `ResStats` GEMM).
     pub zero: Option<&'b mut CudaSlice<f32>>,
@@ -248,9 +286,8 @@ pub fn launch(
                 && tiles <= scratch.counters.len()),
         "gemm: the split-K scratch is too small for m = {m}"
     );
-    let needs_ln = matches!(g.epi, Epilogue::LnRope | Epilogue::LnGeglu);
     ensure!(
-        g.ln.is_some() == needs_ln,
+        g.ln.is_some() == g.epi.ln(),
         "gemm: LayerNorm inputs go with the ln epilogues"
     );
     if let Some(ln) = &g.ln {
@@ -271,8 +308,12 @@ pub fn launch(
         );
     }
     ensure!(
-        g.stats_out.is_some() == (g.epi == Epilogue::ResStats),
-        "gemm: output statistics go with the resstats epilogue"
+        g.stats_out.is_some() == g.epi.res(),
+        "gemm: output statistics go with the resstats epilogues"
+    );
+    ensure!(
+        g.bias.is_some() == g.epi.bias() && g.bias.is_none_or(|b| b.len() == n),
+        "gemm: a bias of n values goes with the bias epilogues"
     );
     if let Some(s) = &g.stats_out {
         ensure!(
@@ -283,7 +324,7 @@ pub fn launch(
 
     let null = 0u64;
     let (a, w, c) = (ptr(stream, g.a), ptr(stream, g.w), ptr(stream, &*g.c));
-    let res = if g.epi == Epilogue::ResStats { c } else { null };
+    let res = if g.epi.res() { c } else { null };
     let (ws, counters) = (ptr(stream, &scratch.ws), ptr(stream, &scratch.counters));
     let (stats_in, colsum, eps) = match &g.ln {
         Some(ln) => (ptr(stream, ln.stats), ptr(stream, ln.colsum), ln.eps),
@@ -291,6 +332,7 @@ pub fn launch(
     };
     let stats_out = g.stats_out.as_deref().map_or(null, |s| ptr(stream, s));
     let rope = g.rope.map_or(null, |r| ptr(stream, r));
+    let bias = g.bias.map_or(null, |b| ptr(stream, b));
     let (zero, zero_len) = g
         .zero
         .as_deref()
@@ -313,7 +355,7 @@ pub fn launch(
     let f = kernels.get(cfg.shape, g.epi);
     let mut launch = stream.launch_builder(f);
     // gemm_*(a, w, c, res, ws, counters, stats_in, colsum, stats_out, zero, zero_len, m, n, k,
-    // eps, rope): pointers are u64, the rest u32 / f32.
+    // eps, rope, bias): pointers are u64, the rest u32 / f32.
     launch
         .arg(&a)
         .arg(&w)
@@ -330,9 +372,10 @@ pub fn launch(
         .arg(&n32)
         .arg(&k32)
         .arg(&eps)
-        .arg(&rope);
+        .arg(&rope)
+        .arg(&bias);
     // SAFETY: the checks above are the kernel's requirements: the sizes of a, w, c, the LN
-    // inputs, the RoPE table and the statistics, n % 64, k % 32, the scratch size for split-K, and a null pointer
+    // inputs, the RoPE table, the bias and the statistics, n % 64, k % 32, the scratch size for split-K, and a null pointer
     // only where the epilogue doesn't read it. The buffers are cudarc allocations or weight spans
     // (16-byte aligned, rows of k a multiple of 32 elements). res aliasing c is allowed; `zero`
     // is not read by this GEMM. The block size matches the kernel's shape.

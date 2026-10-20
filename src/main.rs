@@ -12,6 +12,7 @@ use cudarc::{
 mod attn;
 mod check;
 mod checkpoint;
+mod forward;
 mod gemm;
 mod prep;
 mod timing;
@@ -95,6 +96,8 @@ pub struct Kernels {
     /// The tensor-core GEMMs.
     gemm: gemm::GemmKernels,
     attention: CudaFunction,
+    norm_add: CudaFunction,
+    score: CudaFunction,
 }
 
 /// Loads the embedded PTX, after checking that this GPU can run its tier. The driver
@@ -129,6 +132,8 @@ fn load_kernels(ctx: &Arc<CudaContext>) -> color_eyre::Result<Kernels> {
         gemm_tiled: module.load_function("gemm_tiled")?,
         gemm: gemm::GemmKernels::load(&module)?,
         attention: module.load_function("attention")?,
+        norm_add: module.load_function("norm_add")?,
+        score: module.load_function("score")?,
     })
 }
 
@@ -392,7 +397,7 @@ fn main() -> color_eyre::Result<()> {
     let scratch = gemm::Scratch::new(&stream, n.max(long.ids.len()))?;
     let window = c.local_window / 2;
     let encoder = |x: &CudaSlice<half::f16>| {
-        check::GpuEncoder::new(
+        forward::GpuEncoder::new(
             &stream,
             &kernels,
             &scratch,
@@ -406,6 +411,19 @@ fn main() -> color_eyre::Result<()> {
     };
     let mut layers = encoder(&x)?;
     let mut layers_long = encoder(&x_long)?;
+    let head = |seq: &julia_rs::sequence::Sequence| {
+        let n = seq.ids.len();
+        ensure!(
+            seq.markers.iter().all(|&m| m < n),
+            "a marker is past the sequence"
+        );
+        let markers: Vec<u32> = seq.markers.iter().map(|&m| m as u32).collect();
+        forward::GpuHead::new(
+            &stream, &kernels, &scratch, &gpu, c.norm_eps, sms, n, &markers,
+        )
+    };
+    let mut head_short = head(&seq)?;
+    let mut head_long = head(&long)?;
     let inter = c.intermediate;
     let shapes = [
         ("qkv", 3 * D, D),
@@ -423,16 +441,16 @@ fn main() -> color_eyre::Result<()> {
 
     if check {
         let model = check::reference_model(&dir)?;
-        let x = stream.clone_dtoh(&x)?;
-        check::embed(&model, &host, &seq.ids, c.norm_eps, &x)?;
-        check::qkv0(&model, &host, &seq.ids, &x, &stream.clone_dtoh(&qkv)?)?;
+        let x_host = stream.clone_dtoh(&x)?;
+        check::embed(&model, &host, &seq.ids, c.norm_eps, &x_host)?;
+        check::qkv0(&model, &host, &seq.ids, &x_host, &stream.clone_dtoh(&qkv)?)?;
         let traces = check::trace(&model, &seq.ids);
         use check::Mode;
         // The GEMMs alone, then with attention, each layer from julia-rs's stream; then the whole
         // encoder from embed's output.
         check::layers(&mut layers, &traces, Mode::Gemms, true)?;
         check::layers(&mut layers, &traces, Mode::Layers, true)?;
-        stream.memcpy_htod(&x, &mut layers.x)?;
+        stream.memcpy_htod(&x_host, &mut layers.x)?;
         check::layers(&mut layers, &traces, Mode::Encoder, true)?;
         check::sweep(&mut layers, 1, &traces[1])?;
         // The long request, where the sliding window leaves out most keys.
@@ -440,6 +458,22 @@ fn main() -> color_eyre::Result<()> {
         check::layers(&mut layers_long, &traces, Mode::Layers, false)?;
         stream.memcpy_htod(&stream.clone_dtoh(&x_long)?, &mut layers_long.x)?;
         check::layers(&mut layers_long, &traces, Mode::Encoder, false)?;
+
+        // The head, from julia-rs's encoder output, then the whole forward pass on the GPU (embed,
+        // 22 layers, head) against julia-rs's, for both requests.
+        let traces_short = check::trace(&model, &seq.ids);
+        for (s, t, enc, h, x0) in [
+            (&seq, &traces_short, &mut layers, &mut head_short, &x),
+            (&long, &traces, &mut layers_long, &mut head_long, &x_long),
+        ] {
+            check::head(h, &model, &t[t.len() - 1].x_out, s.qtype, &s.markers)?;
+            stream.memcpy_dtod(x0, &mut enc.x)?;
+            for l in 0..gpu.layout.layers.len() {
+                enc.launch_layer(l)?;
+            }
+            let logits = h.run(&enc.x, s.qtype as usize)?;
+            check::forward(&model, &s.ids, s.qtype, &s.markers, &logits)?;
+        }
     }
 
     if time {
@@ -485,7 +519,7 @@ fn main() -> color_eyre::Result<()> {
         let mut layer_total = 0.0;
         for (gi, &(name, nn, k)) in shapes.iter().enumerate() {
             let flop = 2.0 * (n * nn * k) as f64;
-            let launch = |g: &mut check::GpuEncoder, l: usize| match gi {
+            let launch = |g: &mut forward::GpuEncoder, l: usize| match gi {
                 0 => g.launch_qkv(l),
                 1 => g.launch_wo(l),
                 2 => g.launch_wi(l),
@@ -553,6 +587,34 @@ fn main() -> color_eyre::Result<()> {
             eprintln!(
                 "  encoder ({n_layers} layers, {} launches), {tokens} tokens: {:.3} ms (fastest {:.3})",
                 5 * n_layers,
+                t.median_us / 1e3,
+                t.min_us / 1e3
+            );
+        }
+        // The head, and the whole forward pass: embed, the encoder, the head (from token ids on
+        // the GPU to logits on the GPU; no copies).
+        let ids_short = &ids;
+        for (s, ids, enc, h) in [
+            (&seq, ids_short, &mut layers, &mut head_short),
+            (&long, &long_ids, &mut layers_long, &mut head_long),
+        ] {
+            let tokens = s.ids.len();
+            let launches = 5 * gpu.layout.head.len() + 3;
+            let t = run(&mut || h.launch_all(&enc.x, s.qtype as usize))?;
+            eprintln!(
+                "  head ({launches} launches), {tokens} tokens: {:.2} / {:.2} µs",
+                t.min_us, t.median_us
+            );
+            let mut x_in = stream.clone_dtod(&enc.x)?;
+            let t = timing::time(&stream, 2, 10, 5, &mut || {
+                embed_into(&stream, &kernels, &gpu, ids, c.norm_eps, &mut x_in)?;
+                stream.memcpy_dtod(&x_in, &mut enc.x)?;
+                (0..n_layers).try_for_each(|l| enc.launch_layer(l))?;
+                h.launch_all(&enc.x, s.qtype as usize)
+            })?;
+            eprintln!(
+                "  forward pass ({} launches + a copy), {tokens} tokens: {:.3} ms (fastest {:.3})",
+                1 + 5 * n_layers + launches,
                 t.median_us / 1e3,
                 t.min_us / 1e3
             );

@@ -5,24 +5,20 @@
 //! f32 math, f16 output), to catch bugs: there, only summation order differs, so values may be off
 //! by an f16 ulp but no more.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use color_eyre::eyre::ensure;
-use cudarc::driver::{CudaSlice, CudaStream};
 use half::f16;
 use julia_rs::{
     Model, ModelPaths,
-    attn::{Rope, Scratch as AttnScratch, attention},
+    attn::{Rope, Scratch as AttnScratch, attention, attention_q},
+    head::{QType, answer},
     load_model,
     matmul::{Precision, linear, linear_add},
-    mlp::geglu,
+    mlp::{geglu, gelu_inplace},
 };
 
-use crate::{
-    D,
-    gemm::{self, Config, Epilogue, Gemm, LnInputs},
-    weights::{GpuWeights, HostWeights},
-};
+use crate::{D, gemm, weights::HostWeights};
 
 /// julia-rs's model, for its reference outputs.
 pub fn reference_model(dir: &Path) -> color_eyre::Result<Model> {
@@ -195,7 +191,7 @@ pub fn trace(model: &Model, tokens: &[u32]) -> Vec<LayerTrace> {
     for (l, p) in (model.weights.encoder.layers.iter()).zip(&model.packed.encoder) {
         let x_in = x.clone();
         match &l.attn_norm {
-            Some(g) => layernorm_rows(&x, g.as_f32(data), eps, &mut h),
+            Some(g) => layernorm_rows(&x, g.as_f32(data), None, eps, &mut h),
             None => h.copy_from_slice(&x),
         }
         let mut qkv = vec![0.0; n * 3 * d];
@@ -210,7 +206,7 @@ pub fn trace(model: &Model, tokens: &[u32]) -> Vec<LayerTrace> {
         attention(&qkv, n, d, window, &mut o, &mut s);
         linear_add(&o, &p.wo, None, &mut x);
         let x_mid = x.clone();
-        layernorm_rows(&x, l.mlp_norm.as_f32(data), eps, &mut h);
+        layernorm_rows(&x, l.mlp_norm.as_f32(data), None, eps, &mut h);
         let (mut hh, mut m) = (vec![0.0; n * 2 * inter], vec![0.0; n * inter]);
         linear(&h, &p.wi, None, &mut hh);
         geglu(&hh, inter, &mut m);
@@ -227,8 +223,8 @@ pub fn trace(model: &Model, tokens: &[u32]) -> Vec<LayerTrace> {
     out
 }
 
-/// Bias-free LayerNorm of each `gamma.len()`-wide row, in f64.
-pub fn layernorm_rows(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
+/// LayerNorm of each `gamma.len()`-wide row (with bias `beta`, if any), in f64.
+pub fn layernorm_rows(x: &[f32], gamma: &[f32], beta: Option<&[f32]>, eps: f32, out: &mut [f32]) {
     let k = gamma.len();
     for (row, out) in x.chunks_exact(k).zip(out.chunks_exact_mut(k)) {
         let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / k as f64;
@@ -238,8 +234,9 @@ pub fn layernorm_rows(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
             .sum::<f64>()
             / k as f64;
         let r = 1.0 / (var + f64::from(eps)).sqrt();
-        for ((o, &v), &g) in out.iter_mut().zip(row).zip(gamma) {
-            *o = ((f64::from(v) - mean) * r * f64::from(g)) as f32;
+        for (i, (o, &v)) in out.iter_mut().zip(row).enumerate() {
+            let b = beta.map_or(0.0, |b| f64::from(b[i]));
+            *o = ((f64::from(v) - mean) * r * f64::from(gamma[i]) + b) as f32;
         }
     }
 }
@@ -473,191 +470,156 @@ pub fn layers(
     Ok(worst)
 }
 
-/// The encoder layers on the GPU, with the forward pass's buffers: the stream `x`, and the two
-/// statistics buffers in turn (wo writes `stats_attn` for wi, wo_mlp `stats_mlp` for the next
-/// qkv; each is cleared by the GEMM before its writer: qkv clears `stats_attn`, wi `stats_mlp`).
-pub struct GpuEncoder<'a> {
-    stream: &'a Arc<CudaStream>,
-    kernels: &'a crate::Kernels,
-    scratch: &'a gemm::Scratch,
-    w: &'a GpuWeights,
-    eps: f32,
-    /// The sliding-window layers' reach: keys with |i − j| <= window.
-    window: usize,
-    /// Overrides `gemm::choose` for every GEMM (for sweeps).
-    pub config: Option<Config>,
-    sms: usize,
-    pub x: CudaSlice<f16>,
-    qkv: CudaSlice<f16>,
-    o: CudaSlice<f16>,
-    m: CudaSlice<f16>,
-    stats_attn: CudaSlice<f32>,
-    stats_mlp: CudaSlice<f32>,
+/// julia-rs's head on the encoder output `x_enc` (`[n, D]`, before the final norm), keeping the
+/// intermediates. As `Model::head`, but every head layer on all rows (the marker rows come out the
+/// same) and LayerNorms in f64.
+pub struct HeadTrace {
+    /// After the final norm and the type embedding.
+    pub x0: Vec<f32>,
+    /// After each head layer.
+    pub layers: Vec<Vec<f32>>,
+    pub logits: Vec<f32>,
 }
 
-impl<'a> GpuEncoder<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        stream: &'a Arc<CudaStream>,
-        kernels: &'a crate::Kernels,
-        scratch: &'a gemm::Scratch,
-        w: &'a GpuWeights,
-        eps: f32,
-        window: usize,
-        sms: usize,
-        x: CudaSlice<f16>,
-        inter: usize,
-    ) -> color_eyre::Result<Self> {
-        let n = x.len() / D;
-        Ok(Self {
-            stream,
-            kernels,
-            scratch,
-            w,
+pub fn head_trace(model: &Model, x_enc: &[f32], qtype: QType, markers: &[usize]) -> HeadTrace {
+    let (data, w, d) = (model.data(), &model.weights, D);
+    let n = x_enc.len() / d;
+    let eps = crate::forward::HEAD_LN_EPS;
+    let mut x = vec![0.0; n * d];
+    let final_norm = w.encoder.final_norm.as_f32(data);
+    layernorm_rows(x_enc, final_norm, None, model.config.norm_eps, &mut x);
+    let te = &w.type_emb.as_f32(data)[qtype as usize * d..][..d];
+    for row in x.chunks_exact_mut(d) {
+        for (v, &t) in row.iter_mut().zip(te) {
+            *v += t;
+        }
+    }
+    let x0 = x.clone();
+    let mut layers = vec![];
+    let (mut h, mut q, mut a) = (vec![0.0; n * d], vec![0.0; n * d], vec![0.0; n * d]);
+    let mut kv = vec![0.0; n * 2 * d];
+    let mut s = AttnScratch::default();
+    for (l, p) in w.head.iter().zip(&model.packed.head) {
+        layernorm_rows(
+            &x,
+            l.norm1_w.as_f32(data),
+            Some(l.norm1_b.as_f32(data)),
             eps,
-            window,
-            config: None,
-            sms,
-            qkv: stream.alloc_zeros(n * 3 * D)?,
-            o: stream.alloc_zeros(n * D)?,
-            m: stream.alloc_zeros(n * inter)?,
-            stats_attn: stream.alloc_zeros(2 * n)?,
-            stats_mlp: stream.alloc_zeros(2 * n)?,
-            x,
-        })
+            &mut h,
+        );
+        let (bq, bkv) = l.in_proj_b.as_f32(data).split_at(d);
+        linear(&h, &p.q, Some(bq), &mut q);
+        linear(&h, &p.kv, Some(bkv), &mut kv);
+        attention_q(&q, d, &kv, 2 * d, n, d, None, &mut a, &mut s);
+        linear_add(&a, &p.out_proj, Some(l.out_proj_b.as_f32(data)), &mut x);
+        layernorm_rows(
+            &x,
+            l.norm2_w.as_f32(data),
+            Some(l.norm2_b.as_f32(data)),
+            eps,
+            &mut h,
+        );
+        let mut f = vec![0.0; n * model.config.head_ff];
+        linear(&h, &p.linear1, Some(l.linear1_b.as_f32(data)), &mut f);
+        f.iter_mut().for_each(|v| *v = v.max(0.0));
+        linear_add(&f, &p.linear2, Some(l.linear2_b.as_f32(data)), &mut x);
+        layers.push(x.clone());
     }
-
-    fn rows(&self) -> usize {
-        self.x.len() / D
-    }
-
-    pub fn config_for(&self, n: usize, k: usize) -> Config {
-        self.config
-            .unwrap_or_else(|| gemm::choose(self.rows(), n, k, self.sms))
-    }
-
-    /// Queues layer `l`'s qkv GEMM (the stream → `qkv`).
-    pub fn launch_qkv(&mut self, l: usize) -> color_eyre::Result<()> {
-        let lay = &self.w.layout.layers[l];
-        let w = self.w.f16.slice(lay.wqkv.range());
-        let colsum = lay.qkv_colsum.map(|c| self.w.f32.slice(c.range()));
-        let table = match lay.global {
-            true => self.w.layout.rope_global,
-            false => self.w.layout.rope_local,
-        };
-        let rope = self.w.f32.slice(table.range());
-        let cfg = self.config_for(3 * D, D);
-        let g = Gemm {
-            epi: if colsum.is_some() {
-                Epilogue::LnRope
-            } else {
-                Epilogue::Rope
-            },
-            rope: Some(&rope),
-            a: &self.x,
-            w: &w,
-            k: D,
-            c: &mut self.qkv,
-            ln: colsum.as_ref().map(|colsum| LnInputs {
-                stats: &self.stats_mlp,
-                colsum,
-                eps: self.eps,
-            }),
-            stats_out: None,
-            zero: Some(&mut self.stats_attn),
-        };
-        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
-    }
-
-    /// Queues layer `l`'s attention (qkv → o).
-    pub fn launch_attention(&mut self, l: usize) -> color_eyre::Result<()> {
-        let window = if self.w.layout.layers[l].global {
-            0
-        } else {
-            self.window
-        };
-        crate::attn::launch(
-            self.stream,
-            &self.kernels.attention,
-            &self.qkv,
-            &mut self.o,
-            window,
-        )
-    }
-
-    /// Queues all of layer `l`: qkv, attention, wo, wi, wo_mlp.
-    pub fn launch_layer(&mut self, l: usize) -> color_eyre::Result<()> {
-        self.launch_qkv(l)?;
-        self.launch_attention(l)?;
-        self.launch_wo(l)?;
-        self.launch_wi(l)?;
-        self.launch_wo_mlp(l)
-    }
-
-    /// Queues layer `l`'s Wo GEMM (stream += o · Woᵀ).
-    pub fn launch_wo(&mut self, l: usize) -> color_eyre::Result<()> {
-        let w = self.w.f16.slice(self.w.layout.layers[l].wo.range());
-        let cfg = self.config_for(D, D);
-        let g = Gemm {
-            epi: Epilogue::ResStats,
-            a: &self.o,
-            w: &w,
-            k: D,
-            c: &mut self.x,
-            ln: None,
-            stats_out: Some(&mut self.stats_attn),
-            zero: None,
-            rope: None,
-        };
-        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
-    }
-
-    /// Queues layer `l`'s Wi GEMM (m = GeGLU(LN(stream) · Wiᵀ)).
-    pub fn launch_wi(&mut self, l: usize) -> color_eyre::Result<()> {
-        let lay = &self.w.layout.layers[l];
-        let w = self.w.f16.slice(lay.wi.range());
-        let colsum = self.w.f32.slice(lay.wi_colsum.range());
-        let inter = self.m.len() / self.rows();
-        let cfg = self.config_for(2 * inter, D);
-        let g = Gemm {
-            epi: Epilogue::LnGeglu,
-            a: &self.x,
-            w: &w,
-            k: D,
-            c: &mut self.m,
-            ln: Some(LnInputs {
-                stats: &self.stats_attn,
-                colsum: &colsum,
-                eps: self.eps,
-            }),
-            stats_out: None,
-            zero: Some(&mut self.stats_mlp),
-            rope: None,
-        };
-        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
-    }
-
-    /// Queues layer `l`'s Wo_mlp GEMM (stream += m · Wo_mlpᵀ).
-    pub fn launch_wo_mlp(&mut self, l: usize) -> color_eyre::Result<()> {
-        let w = self.w.f16.slice(self.w.layout.layers[l].wo_mlp.range());
-        let inter = self.m.len() / self.rows();
-        let cfg = self.config_for(D, inter);
-        let g = Gemm {
-            epi: Epilogue::ResStats,
-            a: &self.m,
-            w: &w,
-            k: inter,
-            c: &mut self.x,
-            ln: None,
-            stats_out: Some(&mut self.stats_mlp),
-            zero: None,
-            rope: None,
-        };
-        gemm::launch(self.stream, &self.kernels.gemm, self.scratch, cfg, g)
-    }
+    let sc = &w.scorer;
+    let z: Vec<f32> = markers
+        .iter()
+        .flat_map(|&r| x[r * d..][..d].to_vec())
+        .collect();
+    let mut zn = vec![0.0; z.len()];
+    layernorm_rows(
+        &z,
+        sc.norm_w.as_f32(data),
+        Some(sc.norm_b.as_f32(data)),
+        eps,
+        &mut zn,
+    );
+    let [lin1, lin2] = &model.packed.scorer;
+    let mut y = vec![0.0; z.len()];
+    linear(&zn, lin1, Some(sc.lin1_b.as_f32(data)), &mut y);
+    gelu_inplace(&mut y);
+    let mut logits = vec![0.0; markers.len()];
+    linear(&y, lin2, Some(sc.lin2_b.as_f32(data)), &mut logits);
+    HeadTrace { x0, layers, logits }
 }
 
-impl EncoderSteps for GpuEncoder<'_> {
+/// The largest |Δ| between two logit vectors.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
+    (a.iter().zip(b))
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Logits within this of julia-rs's: an f16 CPU emulation of Julia (julia-rs rounding to f16
+/// where the kernels do) moved them by 0.024 on average over the 2000 typed-decisions
+/// questions, and changed no answer.
+const MAX_LOGIT_DIFF: f64 = 0.15;
+
+/// The head on the GPU (`g`, sized for `x_enc`'s rows and `markers`) from julia-rs's encoder
+/// output `x_enc` (before the final norm), step by step against `head_trace`.
+pub fn head(
+    g: &mut crate::forward::GpuHead,
+    model: &Model,
+    x_enc: &[f32],
+    qtype: QType,
+    markers: &[usize],
+) -> color_eyre::Result<()> {
+    let t = head_trace(model, x_enc, qtype, markers);
+    let x = g.stream.clone_htod(&to_f16(x_enc))?;
+    g.launch_input(&x, qtype as usize)?;
+    let mut errs = vec![rel_err(&to_f32(&g.stream.clone_dtoh(&g.x)?), &t.x0)];
+    for (l, want) in t.layers.iter().enumerate() {
+        g.launch_layer(l)?;
+        errs.push(rel_err(&to_f32(&g.stream.clone_dtoh(&g.x)?), want));
+    }
+    g.launch_score()?;
+    let logits = g.stream.clone_dtoh(&g.logits)?;
+    let diff = max_abs_diff(&logits, &t.logits);
+    eprintln!(
+        "head from julia-rs's encoder output: stream {} (input, then after each layer); logits \
+         {logits:.3?} vs {:.3?}, max |Δ| {diff:.1e}",
+        errs.iter()
+            .map(|e| format!("{e:.2e}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        t.logits
+    );
+    ensure!(
+        errs.iter().all(|&e| e < MAX_ERR.x_out) && diff < MAX_LOGIT_DIFF,
+        "the head is off julia-rs"
+    );
+    Ok(())
+}
+
+/// The whole forward pass's logits (`logits`, from the GPU) against julia-rs's on `ids`.
+pub fn forward(
+    model: &Model,
+    ids: &[u32],
+    qtype: QType,
+    markers: &[usize],
+    logits: &[f32],
+) -> color_eyre::Result<()> {
+    let want = model.forward(ids, qtype, markers);
+    let diff = max_abs_diff(logits, &want);
+    let (a, pa) = answer(qtype, logits);
+    let (b, pb) = answer(qtype, &want);
+    eprintln!(
+        "forward pass, {} tokens: logits {logits:.3?} vs julia-rs {want:.3?}, max |Δ| {diff:.1e}; \
+         answer {a:?} vs {b:?} (probabilities {pa:.3?} vs {pb:.3?})",
+        ids.len()
+    );
+    ensure!(
+        diff < MAX_LOGIT_DIFF && a == b,
+        "the forward pass is off julia-rs"
+    );
+    Ok(())
+}
+
+impl EncoderSteps for crate::forward::GpuEncoder<'_> {
     fn set_stream(&mut self, x: &[f16]) -> color_eyre::Result<()> {
         self.stream.memcpy_htod(x, &mut self.x)?;
         self.stream
@@ -703,7 +665,11 @@ impl EncoderSteps for GpuEncoder<'_> {
 /// Every configuration (shape × split-K) on one layer's GEMMs, each from julia-rs's stream
 /// entering that layer: shape- and split-specific bugs show here, while `layers` runs only the
 /// chosen configurations.
-pub fn sweep(g: &mut GpuEncoder, l: usize, t: &LayerTrace) -> color_eyre::Result<()> {
+pub fn sweep(
+    g: &mut crate::forward::GpuEncoder,
+    l: usize,
+    t: &LayerTrace,
+) -> color_eyre::Result<()> {
     eprintln!("every GEMM configuration on layer {l}:");
     let mut bad = vec![];
     for cfg in gemm::configs() {
@@ -1104,6 +1070,16 @@ mod layer_tests {
             eprintln!("  layer {l}: {e}");
             assert!(within(e, MAX_ERR));
         }
+        // The head reference (all rows, f64 LayerNorms) against julia-rs's own forward pass.
+        let t = head_trace(&model, &traces[21].x_out, long.qtype, &long.markers);
+        let want = model.forward(&long.ids, long.qtype, &long.markers);
+        let diff = max_abs_diff(&t.logits, &want);
+        eprintln!(
+            "head reference: logits {:.4?} vs {want:.4?}, max |Δ| {diff:.1e}",
+            t.logits
+        );
+        assert!(diff < 1e-3);
+
         let mut g = encoder(&long.ids, [false, false, true]);
         g.set_stream(&to_f16(&traces[1].x_in)).unwrap();
         let e = layer(&mut g, 1, &traces[1], true).unwrap();
