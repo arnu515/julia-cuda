@@ -10,3 +10,5 @@ kernels/*.ll
 # The 2000 typed-decisions requests, labels and julia-rs f32 output (README: Run).
 data/
 __pycache__/
+# cargo oxide
+.oxide-artifacts/

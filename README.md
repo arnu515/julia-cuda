@@ -104,6 +104,9 @@ Tiers: `sm_75` (Turing: 2080 Ti), `sm_80` (Ampere), `sm_89` (Ada: 4070), `sm_120
 A binary embeds one tier's PTX and refuses older GPUs; it names the better tier for newer ones.
 Tested on the 2080 Ti and the 4070; sm_80 and sm_120 build but haven't run.
 
+CI (`.github/workflows/build.yml`) builds `julia-cuda-sm_75`, `-sm_89` and `-sm_120` this way on
+every push and keeps each as an artifact of the run (`chmod +x` after downloading).
+
 ## Run
 
 ```sh
