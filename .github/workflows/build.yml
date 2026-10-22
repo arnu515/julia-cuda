@@ -1,0 +1,119 @@
+# Builds dist/julia-cuda-sm_{75,89,120} (one binary per PTX tier, see the Makefile) in the nix
+# shell and uploads each as an artifact. Linux x86_64 only.
+#
+# Caches, from slowest to rebuild to fastest:
+# - the nix store (CUDA, LLVM, the Rust nightly, cargo-oxide): keyed on the flake;
+# - cuda-oxide's codegen backend (librustc_codegen_cuda.so, built by `cargo oxide` on first use):
+#   keyed on the flake (toolchain) and the cuda-oxide commit in kernels/Cargo.lock;
+# - the PTX: keyed on the kernel sources, so a host-only change skips the kernel builds;
+# - cargo's downloads and both crates' compiled dependencies: keyed on the lockfiles.
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # cache-nix-action deletes the nix store caches this one replaces.
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # cargo-oxide asks rustup which toolchain is active when rustup exists; the runner's would
+      # answer with its stable. Without rustup the nix shell's nightly is the only toolchain.
+      - name: Remove the runner's rustup
+        run: rm -rf ~/.rustup ~/.cargo/bin
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore the nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          # Before saving: drop everything the dev shell (rooted below) doesn't need, and
+          # delete older store caches.
+          gc-max-store-size-linux: 0
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # --profile keeps the shell's closure as a GC root, so the store GC above keeps it.
+      - name: Build the dev shell
+        run: nix develop --profile ~/.cache/julia-gpu-dev-shell --command true
+
+      - name: Restore cuda-oxide's backend
+        uses: actions/cache@v6
+        with:
+          # Not ~/.cargo/cuda-oxide/target: the backend's build tree (gigabytes).
+          path: |
+            ~/.cargo/cuda-oxide/librustc_codegen_cuda.so
+            ~/.cargo/cuda-oxide/source-rev.txt
+            ~/.cargo/cuda-oxide/toolchain-fingerprint.txt
+          key: cuda-oxide-backend-${{ hashFiles('flake.lock', 'kernels/Cargo.lock') }}
+
+      - name: Restore the PTX
+        uses: actions/cache@v6
+        with:
+          path: ptx
+          key: ptx-${{ hashFiles('flake.lock', 'Makefile', 'kernels/Cargo.lock', 'kernels/Cargo.toml', 'kernels/src/**') }}
+
+      - name: Restore cargo's downloads and build directories
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernels/target
+          key: cargo-${{ hashFiles('flake.lock', 'Cargo.lock', 'kernels/Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Build the PTX
+        shell: nix develop --command bash -e {0}
+        run: |
+          make ptx
+          # The backend's build tree is only needed to build it; free the disk.
+          rm -rf ~/.cargo/cuda-oxide/target
+
+      - name: Build the binaries
+        shell: nix develop --command bash -e {0}
+        run: |
+          for arch in 75 89 120; do
+            make dist ARCH=$arch
+          done
+          ls -l dist
+
+      # Each binary uploaded as the bare file (no zip). Downloads drop the executable bit:
+      # chmod +x after.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/julia-cuda-sm_75
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/julia-cuda-sm_89
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/julia-cuda-sm_120
+          archive: false
+          if-no-files-found: error
