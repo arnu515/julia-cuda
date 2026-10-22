@@ -16,16 +16,21 @@ the same tile code. One persistent kernel for the whole model is next.
 The 2000 typed-decisions questions (`--max-length 1024 --head-length 512`, 293 tokens on
 average), RTX 2080 Ti, one request at a time:
 
-| engine | correct | same answer as julia-rs f32 | mean latency per request |
-| --- | ---: | ---: | ---: |
-| julia-cuda | 1451 | 2000 / 2000 | 2.18 ms (1.97 ms on the GPU) |
-| julia-cuda, layer kernel (`--layer-fused`) | 1450 | 1997 / 2000 | 2.10 ms (1.89 ms on the GPU) |
-| original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms |
-| original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms |
-| julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) |
+| engine | correct | same answer as julia-rs f32 | mean per request, wall | on the GPU |
+| --- | ---: | ---: | ---: | ---: |
+| julia-cuda | 1451 | 2000 / 2000 | 2.18 ms | 1.92 ms |
+| julia-cuda, layer kernel (`--layer-fused`) | 1450 | 1997 / 2000 | 2.10 ms | 1.83 ms |
+| original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms | |
+| original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms | |
+| julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) | |
 
-The layer kernel's three different answers are near-ties (julia-rs's margins 0.34, 0.04 and
-0.04 logits); its mean |Δlogit| to julia-rs is the per-step kernels' (0.0224 vs 0.0225).
+GPU time (embed to logits) is the mean of three runs of each julia-cuda engine, alternated in one
+session: per-step kernels 1.934, 1.908, 1.920 ms; layer kernel 1.815, 1.833, 1.844 ms. The layer
+kernel is faster in every pair, by 4.7% on average, mostly on long requests (the medians are
+within 1.6%, the p99s ~6% apart). Wall time (parse to result) is from one earlier run of each.
+
+Of the layer kernel's three different answers, two are near-ties (julia-rs's margin 0.04 logits)
+and one is not (0.34); its mean |Δlogit| to julia-rs is the per-step kernels' (0.0224 vs 0.0225).
 
 ## What runs on the GPU
 
