@@ -2,6 +2,7 @@
 name = "kernels"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
 
 # this crate has to be in its own workspace since it is compiled by cargo-oxide.
 [workspace]

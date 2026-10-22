@@ -154,3 +154,7 @@ than the pinned 5.0.0, add `--upstream-encoder`.
 - The head's last layer runs on every row (julia-rs: marker rows only; the results are the same).
 - Attention uses ~214 registers per thread (the GEMMs 70-139), and with it the layer kernel ~228.
 - Laptop GPUs vary in clock speed between and within runs; compare timings on the 2080 Ti.
+
+## License
+
+AGPL-3.0-or-later (`LICENSE`).

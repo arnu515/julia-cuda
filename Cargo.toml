@@ -2,6 +2,7 @@
 name = "julia-cuda"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
 
 # Which PTX tier the binary embeds (src/main.rs); one per build, see the Makefile's ARCH.
 # Without any, sm_75, which every GPU we use can JIT-compile.
