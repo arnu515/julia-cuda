@@ -12,3 +12,5 @@ data/
 __pycache__/
 # cargo oxide
 .oxide-artifacts/
+# The Julia-1 checkpoint (tests default to ./model; JULIA_MODEL overrides)
+/model

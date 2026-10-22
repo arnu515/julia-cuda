@@ -1,15 +1,16 @@
-# julia-gpu
+# julia-cuda
 
-A GPU inference engine for Julia-1 (the 22-layer ModernBERT decision model), with kernels in
+A GPU inference engine for [Julia-1](https://huggingface.co/SupersonicLabs/Julia-1) (the
+22-layer ModernBERT typed-decision model), with kernels in
 Rust ([cuda-oxide](https://github.com/NVIDIA/cuda-rust)) and a host on
 [cudarc](https://github.com/coreylowman/cudarc). [julia-rs](https://github.com/arnu515/julia-rs)
 (the CPU engine) is the reference: checkpoint loading, tokenizer, request format and f32 outputs.
 
-It has two encoder paths. The **unfused reference** (tag
-`unfused-reference`): every step of the forward pass is its own kernel launch, with the fusions
-that fit in a GEMM epilogue. The **layer kernel** (`--layer-fused`): each encoder
-layer as one persistent launch, its five steps as phases with grid barriers in between, running
-the same tile code. One persistent kernel for the whole model is next.
+It has two encoder paths. The **per-step kernels** (the default; tag `unfused-reference`): every
+step of the forward pass is its own kernel launch, with the fusions that fit in a GEMM epilogue.
+The **layer kernel** (`--layer-fused`; tag `layer-kernel`): each encoder layer as one persistent
+launch, its five steps as phases with grid barriers in between, running the same tile code. One
+persistent kernel for the whole model is next.
 
 ## Results
 
@@ -18,10 +19,10 @@ average), RTX 2080 Ti, one request at a time:
 
 | engine | correct | same answer as julia-rs f32 | mean per request, wall | on the GPU |
 | --- | ---: | ---: | ---: | ---: |
-| julia-cuda | 1451 | 2000 / 2000 | 2.18 ms | 1.92 ms |
+| julia-cuda, per-step kernels | 1451 | 2000 / 2000 | 2.18 ms | 1.92 ms |
 | julia-cuda, layer kernel (`--layer-fused`) | 1450 | 1997 / 2000 | 2.10 ms | 1.83 ms |
-| original runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms | |
-| original runtime (PyTorch fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms | |
+| Julia-1's PyTorch runtime + CUDA graphs (`--cuda-graphs`) | 1452 | 1998 / 2000 | 6.28 ms | |
+| Julia-1's PyTorch runtime (fp16, `tools/torch_baseline.py`) | 1452 | 1998 / 2000 | 23.2 ms | |
 | julia-rs f32 (CPU) | 1451 | | 68.1 ms (Core Ultra 9 185H, 6 cores) | |
 
 GPU time (embed to logits) is the mean of three runs of each julia-cuda engine, alternated in one
@@ -31,6 +32,7 @@ within 1.6%, the p99s ~6% apart). Wall time (parse to result) is from one earlie
 
 Of the layer kernel's three different answers, two are near-ties (julia-rs's margin 0.04 logits)
 and one is not (0.34); its mean |Δlogit| to julia-rs is the per-step kernels' (0.0224 vs 0.0225).
+The likely cause is a different summation order (tile plans, atomic row statistics) in f16.
 
 ## What runs on the GPU
 
@@ -89,7 +91,9 @@ kernel's own timestamps (`prof`, `src/profile.rs`).
 - `src/serve.rs`: the request mode.
 - `src/check.rs`: `--check`: julia-rs references for every step, host emulations of the
   kernels' arithmetic, and the comparisons. `src/timing.rs`: `--time` (CUDA events).
-- `tools/torch_baseline.py`: the original PyTorch runtime on the GPU, for baselines.
+- `tools/torch_baseline.py`: Julia-1's PyTorch runtime on the GPU, for baselines.
+- `tools/typed_requests.py`, `tools/score.py`: the 2000 typed-decisions questions as requests,
+  and scoring results against their labels and a reference run.
 
 ## Build
 
@@ -120,12 +124,22 @@ julia-cuda MODEL_DIR --max-length 1024 --head-length 512 [--layer-fused] < reque
 
 One request per line, julia-rs's format and result fields (`logits`, `probabilities`,
 `truncated`, `choice` / `score` / `noul`); latency percentiles on stderr. `MODEL_DIR` is the
-Julia-1 checkpoint. The 2000 questions: `tools/typed_requests.py` gives `rows.jsonl` and
-`labels.jsonl` from the typed-decisions test split; julia-rs gives the f32 results. Then
+Julia-1 checkpoint (`model.safetensors`, `julia_config.json`, `encoder/config.json`,
+`tokenizer/` from the Hugging Face repo).
+
+The 2000 typed-decisions questions: download `all/test-00000-of-00001.parquet` from the
+[LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) dataset,
+then
 
 ```sh
-python3 tools/score.py labels.jsonl results.jsonl julia-rs-f32.jsonl
+uv run --no-project --with pyarrow python tools/typed_requests.py test.parquet data   # rows.jsonl, labels.jsonl
+julia-rs MODEL_DIR --max-length 1024 --head-length 512 < data/rows.jsonl > data/julia-rs-f32.jsonl
+julia-cuda MODEL_DIR --max-length 1024 --head-length 512 < data/rows.jsonl > data/results.jsonl
+python3 tools/score.py data/labels.jsonl data/results.jsonl data/julia-rs-f32.jsonl
 ```
+
+`score.py` prints the accuracy, and the agreement and mean / max logit difference with the
+reference run.
 
 Diagnostics, on a 72- and a 363-token sample request:
 
@@ -138,7 +152,7 @@ Diagnostics, on a 72- and a 363-token sample request:
   plans phase by phase (at 72-607 tokens, with `phase_cost`'s estimates) and its per-phase
   profiles.
 
-## Baselines: the original runtime
+## Baselines: Julia-1's PyTorch runtime
 
 `tools/torch_baseline.py` runs the Hugging Face repo's own PyTorch runtime (`FastEngine`, cuBLAS +
 SDPA) on the same requests and writes the same result format. It needs `torch`,
