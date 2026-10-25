@@ -83,18 +83,19 @@ fn frames(ips: &[usize]) -> Vec<String> {
         }
         names.extend(here); // innermost first, as resolve gives inlined frames
     }
-    // Drop the recording machinery: everything up to and including `around` itself.
+    // Drop the recording machinery: everything up to and including `around` itself. (Without
+    // full debug info, inlined frames have their short names: "around<…>".)
     if let Some(i) = names
         .iter()
-        .rposition(|n| n.starts_with("julia_cuda::flame::around"))
+        .rposition(|n| n.starts_with("julia_cuda::flame::around") || n.starts_with("around<"))
     {
         names.drain(..=i);
     }
     names.reverse();
-    // Drop the runtime below the program's main.
+    // Drop the runtime below the program's main: the deepest `main` (C's is above Rust's).
     if let Some(i) = names
         .iter()
-        .position(|n| n.ends_with("::main") && !n.starts_with("std::") && !n.starts_with("core::"))
+        .rposition(|n| n == "main" || n.ends_with("::main"))
     {
         names.drain(..i);
     }
