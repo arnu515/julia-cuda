@@ -83,7 +83,10 @@ kernel's own timestamps (`prof`, `src/profile.rs`).
   kernel), `gemm.rs` and `attn.rs` (their building blocks), `helpers.rs`.
 - `kernels/src/prof.rs`: the layer kernel's timestamps; `src/profile.rs` turns them into
   per-phase tables and sweeps the layer kernel's plans (`--time`).
-- `src/main.rs`: PTX selection and loading, the `embed` and `gemm_tiled` launches, the CLI.
+- `src/lib.rs`: PTX selection and loading, the `embed` and `gemm_tiled` launches. `src/main.rs`:
+  the CLI.
+- `src/engine.rs`: `Engine`, for programs embedding julia-cuda: load a checkpoint onto GPU 0,
+  tokenize requests, run them (a batch queued back to back, one wait).
 - `src/checkpoint.rs`, `src/weights.rs`, `src/prep.rs`: reading the checkpoint, the weight
   layout and its preparation.
 - `src/gemm.rs`, `src/attn.rs`: launching the GEMMs (and their checks) and attention.
