@@ -92,6 +92,15 @@ jobs:
           # The backend's build tree is only needed to build it; free the disk.
           rm -rf ~/.cargo/cuda-oxide/target
 
+      # The library (`julia_cuda::Engine`) and the CLI; tests that need the checkpoint skip
+      # themselves without one.
+      - name: Lint and test
+        shell: nix develop --command bash -e {0}
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
+
       - name: Build the binaries
         shell: nix develop --command bash -e {0}
         run: |
