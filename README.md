@@ -105,7 +105,8 @@ toolkit and the Rust nightly that cuda-oxide needs.
 
 ```sh
 make                 # PTX for every tier + the release binary (tier ARCH, default 75)
-make dist ARCH=75    # dist/julia-cuda-sm_75: stripped, runs outside nix (needs glibc 2.34+)
+make dist ARCH=75    # dist/julia-cuda-sm_75 and dist/libjulia_cuda-sm_75.so: stripped, run
+                     # outside nix (need glibc 2.34+)
 make dist ARCH=89    # the same for the 4070
 make -B ptx VERBOSE=1    # ptxas's register / spill / shared memory report per kernel
 make CHECKED=1       # PTX with slice bounds checks (an out-of-bounds index traps)
@@ -116,8 +117,14 @@ Tiers: `sm_75` (Turing: 2080 Ti), `sm_80` (Ampere), `sm_89` (Ada: 4070), `sm_120
 A binary embeds one tier's PTX and refuses older GPUs; it names the better tier for newer ones.
 Tested on the 2080 Ti and the 4070; sm_80 and sm_120 build but haven't run.
 
-CI (`.github/workflows/build.yml`) builds `julia-cuda-sm_75`, `-sm_89` and `-sm_120` this way on
-every push and keeps each as an artifact of the run (`chmod +x` after downloading).
+CI (`.github/workflows/build.yml`) builds `julia-cuda-sm_{75,80,89,120}` and
+`libjulia_cuda-sm_{75,80,89,120}.so` this way on every push and keeps each as an artifact of the
+run (`chmod +x` after downloading).
+
+`libjulia_cuda` is the C interface (`src/capi.rs`): `julia_cuda_load`, `julia_cuda_run` (token
+ids and marker positions in, logits and GPU time out; per-step kernels or the layer kernel),
+`julia_cuda_free`, `julia_cuda_device`, `julia_cuda_tier`. megaLaya's harness loads it with
+ctypes.
 
 ## Run
 

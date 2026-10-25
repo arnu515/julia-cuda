@@ -1,5 +1,6 @@
-# Builds dist/julia-cuda-sm_{75,89,120} (one binary per PTX tier, see the Makefile) in the nix
-# shell and uploads each as an artifact. Linux x86_64 only.
+# Builds dist/julia-cuda-sm_{75,80,89,120} (one binary per PTX tier, see the Makefile) and
+# dist/libjulia_cuda-sm_*.so (the C interface, for megaLaya's harness) in the nix shell, and
+# uploads each as an artifact. Linux x86_64 only.
 #
 # Caches, from slowest to rebuild to fastest:
 # - the nix store (CUDA, LLVM, the Rust nightly, cargo-oxide): keyed on the flake;
@@ -104,16 +105,31 @@ jobs:
       - name: Build the binaries
         shell: nix develop --command bash -e {0}
         run: |
-          for arch in 75 89 120; do
+          for arch in 75 80 89 120; do
             make dist ARCH=$arch
           done
           ls -l dist
 
-      # Each binary uploaded as the bare file (no zip). Downloads drop the executable bit:
+      # Each file uploaded bare (no zip). Downloads drop the executable bit:
       # chmod +x after.
       - uses: actions/upload-artifact@v7
         with:
           path: dist/julia-cuda-sm_75
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/libjulia_cuda-sm_75.so
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/julia-cuda-sm_80
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/libjulia_cuda-sm_80.so
           archive: false
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
@@ -123,6 +139,16 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
+          path: dist/libjulia_cuda-sm_89.so
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
           path: dist/julia-cuda-sm_120
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/libjulia_cuda-sm_120.so
           archive: false
           if-no-files-found: error

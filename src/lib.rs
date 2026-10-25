@@ -13,6 +13,7 @@ use cudarc::{
 };
 
 pub mod attn;
+pub mod capi;
 pub mod check;
 pub mod checkpoint;
 pub mod engine;
@@ -83,6 +84,11 @@ macro_rules! embed_ptx {
 }
 
 embed_ptx!("sm_120", "sm_89", "sm_80", "sm_75");
+
+/// The PTX tier this build embeds ("sm_89").
+pub fn ptx_tier() -> &'static str {
+    PTX.tier
+}
 
 /// The kernels, looked up once (`load_function` is a lookup in the module: not something to
 /// repeat per launch).

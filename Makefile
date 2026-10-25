@@ -2,7 +2,8 @@
 # and a copy of that binary that runs outside nix. Must be run in the nix shell.
 #
 #   make               PTX (every tier) + release host binary embedding tier ARCH
-#   make dist          dist/julia-cuda-sm_ARCH: stripped, loader at /lib64, for the GPU machines
+#   make dist          dist/julia-cuda-sm_ARCH: stripped, loader at /lib64, for the GPU machines;
+#                      and dist/libjulia_cuda-sm_ARCH.so, the C interface (src/capi.rs)
 #   make dist ARCH=89  the same for another tier: 75 (2080 Ti, default), 80, 89 (4070), 120
 #   make CHECKED=1     PTX with slice bounds checks (an out-of-bounds index traps)
 #   make -B ptx VERBOSE=1   also print ptxas's register / spill / shared memory report
@@ -55,6 +56,9 @@ dist: build
 	cp $(TARGET_DIR)/release/julia-cuda dist/julia-cuda-sm_$(ARCH)
 	strip dist/julia-cuda-sm_$(ARCH)
 	patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath dist/julia-cuda-sm_$(ARCH)
+	cp $(TARGET_DIR)/release/libjulia_cuda.so dist/libjulia_cuda-sm_$(ARCH).so
+	strip --strip-unneeded dist/libjulia_cuda-sm_$(ARCH).so
+	patchelf --remove-rpath dist/libjulia_cuda-sm_$(ARCH).so
 
 clean:
 	rm -rf ptx dist

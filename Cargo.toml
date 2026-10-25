@@ -6,6 +6,10 @@ license = "AGPL-3.0-or-later"
 
 # Which PTX tier the binary embeds (src/main.rs); one per build, see the Makefile's ARCH.
 # Without any, sm_75, which every GPU we use can JIT-compile.
+# rlib for Rust programs (`Engine`), cdylib for the C interface (`capi`).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 sm_75 = []
 sm_80 = []
