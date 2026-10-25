@@ -47,6 +47,10 @@ pub fn launch(
     launch.arg(qkv).arg(o).arg(&n32).arg(&w32);
     // SAFETY: qkv is [n, 3·D] and o [n, D] (checked), both cudarc allocations (16-byte aligned);
     // n > 0; the grid covers ⌈n/64⌉ query blocks × 6 heads with the kernel's 128 threads.
-    unsafe { launch.launch(cfg) }?;
+    crate::flame::around(
+        stream,
+        || "attention".into(),
+        || unsafe { launch.launch(cfg) },
+    )?;
     Ok(())
 }

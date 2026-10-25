@@ -385,7 +385,8 @@ pub fn launch(
     // only where the epilogue doesn't read it. The buffers are cudarc allocations or weight spans
     // (16-byte aligned, rows of k a multiple of 32 elements). res aliasing c is allowed; `zero`
     // is not read by this GEMM. The block size matches the kernel's shape.
-    unsafe { launch.launch(cfg_launch) }
-        .map_err(|e| eyre!("gemm_{}_{} ({cfg}): {e}", cfg.shape.name(), g.epi.name()))?;
+    let name = || format!("gemm_{}_{}", cfg.shape.name(), g.epi.name());
+    crate::flame::around(stream, name, || unsafe { launch.launch(cfg_launch) })
+        .map_err(|e| eyre!("{} ({cfg}): {e}", name()))?;
     Ok(())
 }

@@ -17,6 +17,7 @@ pub mod capi;
 pub mod check;
 pub mod checkpoint;
 pub mod engine;
+pub mod flame;
 pub mod forward;
 pub mod gemm;
 pub mod prep;
@@ -213,7 +214,7 @@ pub fn embed_into(
         .arg(x);
     // SAFETY: the arguments match that signature, block size is a multiple of 32,
     //   and x's dimensions match properly.
-    unsafe { launch.launch(cfg) }?;
+    flame::around(stream, || "embed".into(), || unsafe { launch.launch(cfg) })?;
     Ok(())
 }
 
@@ -285,7 +286,11 @@ pub fn gemm_tiled_into(
     // SAFETY: the arguments match that signature, with the checks above: k is a multiple of 32,
     //   n of 64, and c has m·n elements. a is a cudarc allocation and w a weight span, so both
     //   are 16-byte aligned. The block is 256 threads, as the kernel's indexing assumes.
-    unsafe { launch.launch(cfg) }?;
+    flame::around(
+        stream,
+        || "gemm_tiled".into(),
+        || unsafe { launch.launch(cfg) },
+    )?;
     Ok(())
 }
 

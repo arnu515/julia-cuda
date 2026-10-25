@@ -342,12 +342,16 @@ impl<'a> GpuEncoder<'a> {
             // for this layer (checked, grid <= max_grid). With barriers (more than one phase), a
             // cooperative launch with at most the resident number of blocks, so they can't
             // deadlock; one phase has none. 128 threads, as the kernel assumes.
-            unsafe {
-                match (phases & 0x1f).count_ones() {
-                    1 => launch.launch(cfg),
-                    _ => launch.launch_cooperative(cfg),
-                }
-            }?;
+            crate::flame::around(
+                self.stream,
+                || "layer".into(),
+                || unsafe {
+                    match (phases & 0x1f).count_ones() {
+                        1 => launch.launch(cfg),
+                        _ => launch.launch_cooperative(cfg),
+                    }
+                },
+            )?;
             let barriers = (phases & 0x1f).count_ones() - 1;
             self.bar_count = self.bar_count.wrapping_add(barriers * grid);
         }
@@ -534,7 +538,12 @@ impl<'a> GpuHead<'a> {
         // SAFETY: x_enc and out are [n, D] and stats has 2n values; gamma and the type embedding
         // are D-long weight spans (16-byte aligned: the type embedding's rows are 1536 bytes into
         // a 128-byte aligned span); blocks of 128 threads, one warp per row.
-        unsafe { launch.launch(cfg) }?;
+        let stream = self.stream;
+        crate::flame::around(
+            stream,
+            || "norm_add".into(),
+            || unsafe { launch.launch(cfg) },
+        )?;
         Ok(())
     }
 
@@ -704,7 +713,8 @@ impl<'a> GpuHead<'a> {
             .arg(&mut self.logits);
         // SAFETY: y is [n, D], lin2 D values, logits one per marker; the markers are rows < n
         // (checked by `new`'s caller, see `run`); blocks of 128 threads, one warp per marker.
-        unsafe { launch.launch(cfg) }?;
+        let stream = self.stream;
+        crate::flame::around(stream, || "score".into(), || unsafe { launch.launch(cfg) })?;
         Ok(())
     }
 
